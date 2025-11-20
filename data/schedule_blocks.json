@@ -1,0 +1,16 @@
+{
+  "blocked_slots": {},
+  "work_settings": {
+    "workdays": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "work_start_hour": 12,
+    "work_end_hour": 18
+  }
+}

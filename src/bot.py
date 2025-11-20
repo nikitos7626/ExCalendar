@@ -12,12 +12,14 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    JobQueue,
     MessageHandler,
     filters,
 )
 
 from .booking_store import BookingStore, BookingRequest
 from .config import Settings, load_settings
+from .schedule_manager import ScheduleManager
 from .keyboards import (
     build_admin_cancel_keyboard,
     build_admin_cancel_reason_keyboard,
@@ -26,7 +28,14 @@ from .keyboards import (
     build_dates_keyboard,
     build_decline_reason_keyboard,
     build_request_review_keyboard,
+    build_schedule_day_times_keyboard,
+    build_schedule_days_keyboard,
+    build_schedule_manage_keyboard,
+    build_schedule_weeks_keyboard,
     build_times_keyboard,
+    build_work_days_keyboard,
+    build_work_hours_keyboard,
+    build_work_settings_keyboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +44,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 
 settings: Settings = load_settings()
 store = BookingStore(settings.storage_path)
+schedule_manager = ScheduleManager(settings.storage_path.parent / "schedule_blocks.json")
 timezone = pytz.timezone(settings.timezone)
 daily_slots = []
 CLIENT_CANCELABLE_STATUSES = {"pending", "confirmed"}
@@ -49,7 +59,8 @@ STATUS_BADGES = {
 BUTTON_BOOK = "📅 Записаться"
 BUTTON_MY = "🗓 Мои записи"
 BUTTON_TRAINER = "📘 Записи тренера"
-MENU_BUTTONS = {BUTTON_BOOK, BUTTON_MY, BUTTON_TRAINER}
+BUTTON_SCHEDULE = "⚙️ Управление расписанием"
+MENU_BUTTONS = {BUTTON_BOOK, BUTTON_MY, BUTTON_TRAINER, BUTTON_SCHEDULE}
 DATES_PAGE_SIZE = 6
 
 
@@ -59,7 +70,7 @@ def is_instructor(user_id: int) -> bool:
 
 def build_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     if is_instructor(user_id):
-        rows = [[BUTTON_TRAINER]]
+        rows = [[BUTTON_TRAINER], [BUTTON_SCHEDULE]]
     else:
         rows = [[BUTTON_BOOK, BUTTON_MY]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -104,11 +115,25 @@ WEEKDAYS_RU_FULL = [
 WEEKDAYS_RU_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 
+def get_effective_work_settings() -> Tuple[List[int], int, int]:
+    """Get work settings from schedule_manager or fallback to config."""
+    custom = schedule_manager.get_work_settings()
+    if custom:
+        return (
+            custom["workdays"],
+            custom["work_start_hour"],
+            custom["work_end_hour"],
+        )
+    return settings.workdays, settings.work_start_hour, settings.work_end_hour
+
+
 def _generate_daily_slots() -> List[str]:
+    """Generate daily slots based on current work settings."""
+    _, work_start, work_end = get_effective_work_settings()
     slots: List[str] = []
     slot_delta = timedelta(minutes=settings.slot_duration_minutes)
-    cursor = datetime.combine(date.today(), time(hour=settings.work_start_hour))
-    end_time = time(hour=settings.work_end_hour)
+    cursor = datetime.combine(date.today(), time(hour=work_start))
+    end_time = time(hour=work_end)
     while cursor.time() < end_time:
         slots.append(cursor.strftime("%H:%M"))
         cursor += slot_delta
@@ -117,17 +142,32 @@ def _generate_daily_slots() -> List[str]:
     return slots
 
 
+def refresh_daily_slots() -> None:
+    """Refresh daily slots when work settings change."""
+    global daily_slots
+    daily_slots = _generate_daily_slots()
+
+
 daily_slots = _generate_daily_slots()
 
 
 def collect_available_dates_with_labels() -> List[Tuple[date, str]]:
     cleanup_expired_requests()
+    schedule_manager.cleanup_past_blocks(datetime.now(timezone))
+    refresh_daily_slots()  # Refresh in case settings changed
+    workdays, _, _ = get_effective_work_settings()
     today = datetime.now(timezone).date()
     result: List[Tuple[date, str]] = []
+    blocked_dates = schedule_manager.get_all_blocked_dates()
     for offset in range(settings.booking_horizon_days):
         candidate = today + timedelta(days=offset)
-        if candidate.weekday() in settings.workdays:
-            result.append((candidate, format_day_short(candidate)))
+        if candidate.weekday() in workdays:
+            # Skip fully blocked days (when all slots are blocked)
+            date_str = candidate.isoformat()
+            blocked_slots = schedule_manager.get_blocked_slots_for_day(date_str)
+            # If day is not fully blocked, include it
+            if len(blocked_slots) < len(daily_slots):
+                result.append((candidate, format_day_short(candidate)))
     return result
 
 
@@ -294,10 +334,13 @@ async def date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
     busy_map = store.list_day_states(date_str)
+    blocked_slots = set(schedule_manager.get_blocked_slots_for_day(date_str))
     free_slots = [
         slot
         for slot in daily_slots
-        if slot not in busy_map or busy_map[slot] not in {"pending", "confirmed"}
+        if slot not in busy_map
+        and busy_map.get(slot) not in {"pending", "confirmed"}
+        and slot not in blocked_slots
     ]
     keyboard = build_times_keyboard(date_str, free_slots, back_page=page)
     await query.edit_message_text(
@@ -334,6 +377,16 @@ async def time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     slot_dt = timezone.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
     if slot_dt < datetime.now(timezone):
         await query.answer("Нельзя выбрать прошедшее время", show_alert=True)
+        return
+
+    # Check if slot is blocked
+    if schedule_manager.is_slot_blocked(date_str, time_str):
+        await query.answer("Этот слот закрыт для записи тренером", show_alert=True)
+        dates, page, _ = find_dates_and_page(date_str)
+        await query.edit_message_text(
+            "Этот слот закрыт. Выбери другую дату:",
+            reply_markup=build_dates_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE),
+        )
         return
 
     dates, page, _ = find_dates_and_page(date_str)
@@ -575,6 +628,9 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if is_instructor(user.id) and text == BUTTON_TRAINER:
         await show_instructor_bookings(update, context)
         return
+    if is_instructor(user.id) and text == BUTTON_SCHEDULE:
+        await schedule_manage_command(update, context)
+        return
 
     await message.reply_text(
         "Используйте кнопки ниже, чтобы продолжить.",
@@ -802,6 +858,592 @@ async def ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.callback_query.answer()
 
 
+async def schedule_manage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show schedule management menu for trainer."""
+    user = update.effective_user
+    if not is_instructor(user.id):
+        await update.message.reply_text(
+            "Эта функция доступна только тренеру.",
+            reply_markup=build_main_keyboard(user.id),
+        )
+        return
+    await update.message.reply_text(
+        "⚙️ <b>Управление расписанием</b>\n\n"
+        "Выберите, что хотите настроить:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_schedule_manage_keyboard(),
+    )
+
+
+async def schedule_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Return to schedule management menu."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    await query.edit_message_text(
+        "⚙️ <b>Управление расписанием</b>\n\n"
+        "Выберите, что хотите настроить:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_schedule_manage_keyboard(),
+    )
+
+
+async def schedule_days_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show days management interface."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    schedule_manager.cleanup_past_blocks(datetime.now(timezone))
+    dates = collect_available_dates_with_labels()
+    # Also include fully blocked days for unblocking
+    today = datetime.now(timezone).date()
+    blocked_dates = schedule_manager.get_all_blocked_dates()
+    for offset in range(settings.booking_horizon_days):
+        candidate = today + timedelta(days=offset)
+        if candidate.weekday() in settings.workdays:
+            date_str = candidate.isoformat()
+            if date_str in blocked_dates:
+                # Check if it's already in dates
+                if not any(d[0] == candidate for d in dates):
+                    dates.append((candidate, format_day_short(candidate)))
+    dates.sort(key=lambda x: x[0])
+    keyboard = build_schedule_days_keyboard(dates, page=0, page_size=DATES_PAGE_SIZE)
+    await query.edit_message_text(
+        "📅 <b>Управление днями</b>\n\n"
+        "Выберите день для настройки слотов:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_days_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Navigate schedule days pages."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, page_str = query.data.split("|", maxsplit=1)
+    page = int(page_str)
+    schedule_manager.cleanup_past_blocks(datetime.now(timezone))
+    dates = collect_available_dates_with_labels()
+    today = datetime.now(timezone).date()
+    blocked_dates = schedule_manager.get_all_blocked_dates()
+    for offset in range(settings.booking_horizon_days):
+        candidate = today + timedelta(days=offset)
+        if candidate.weekday() in settings.workdays:
+            date_str = candidate.isoformat()
+            if date_str in blocked_dates:
+                if not any(d[0] == candidate for d in dates):
+                    dates.append((candidate, format_day_short(candidate)))
+    dates.sort(key=lambda x: x[0])
+    keyboard = build_schedule_days_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE)
+    await query.edit_message_text(
+        "📅 <b>Управление днями</b>\n\n"
+        "Выберите день для настройки слотов:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_day_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show time slots for a specific day."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    refresh_daily_slots()  # Refresh in case settings changed
+    _, date_str = query.data.split("|", maxsplit=1)
+    day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
+    blocked_times = schedule_manager.get_blocked_slots_for_day(date_str)
+    keyboard = build_schedule_day_times_keyboard(date_str, daily_slots, blocked_times)
+    await query.edit_message_text(
+        f"📅 <b>Управление слотами</b>\n\n"
+        f"День: {day_label}\n"
+        f"🔒 — закрыт, 🔓 — открыт\n\n"
+        f"Нажмите на слот, чтобы изменить его статус:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_slot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle slot block/unblock."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, date_str, time_str, action = query.data.split("|", maxsplit=3)
+    if action == "block":
+        schedule_manager.block_slot(date_str, time_str)
+        await query.answer("Слот закрыт ✅", show_alert=True)
+    else:
+        schedule_manager.unblock_slot(date_str, time_str)
+        await query.answer("Слот открыт ✅", show_alert=True)
+    # Refresh the day view
+    refresh_daily_slots()  # Refresh in case settings changed
+    day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
+    blocked_times = schedule_manager.get_blocked_slots_for_day(date_str)
+    keyboard = build_schedule_day_times_keyboard(date_str, daily_slots, blocked_times)
+    await query.edit_message_text(
+        f"📅 <b>Управление слотами</b>\n\n"
+        f"День: {day_label}\n"
+        f"🔒 — закрыт, 🔓 — открыт\n\n"
+        f"Нажмите на слот, чтобы изменить его статус:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_day_block_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Block entire day."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, date_str = query.data.split("|", maxsplit=1)
+    schedule_manager.block_day(date_str, daily_slots)
+    await query.answer("Весь день закрыт ✅", show_alert=True)
+    day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
+    blocked_times = schedule_manager.get_blocked_slots_for_day(date_str)
+    keyboard = build_schedule_day_times_keyboard(date_str, daily_slots, blocked_times)
+    await query.edit_message_text(
+        f"📅 <b>Управление слотами</b>\n\n"
+        f"День: {day_label}\n"
+        f"🔒 — закрыт, 🔓 — открыт\n\n"
+        f"Нажмите на слот, чтобы изменить его статус:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_day_unblock_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unblock entire day."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, date_str = query.data.split("|", maxsplit=1)
+    schedule_manager.unblock_day(date_str)
+    await query.answer("Весь день открыт ✅", show_alert=True)
+    day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
+    blocked_times = schedule_manager.get_blocked_slots_for_day(date_str)
+    keyboard = build_schedule_day_times_keyboard(date_str, daily_slots, blocked_times)
+    await query.edit_message_text(
+        f"📅 <b>Управление слотами</b>\n\n"
+        f"День: {day_label}\n"
+        f"🔒 — закрыт, 🔓 — открыт\n\n"
+        f"Нажмите на слот, чтобы изменить его статус:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_weeks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show weeks management interface."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    schedule_manager.cleanup_past_blocks(datetime.now(timezone))
+    today = datetime.now(timezone).date()
+    weeks: List[Tuple[date, str]] = []
+    for offset in range(0, settings.booking_horizon_days, 7):
+        week_start = today + timedelta(days=offset - today.weekday())
+        week_end = week_start + timedelta(days=6)
+        label = f"{format_day_short(week_start)} - {format_day_short(week_end)}"
+        weeks.append((week_start, label))
+    keyboard = build_schedule_weeks_keyboard(weeks, page=0, page_size=5)
+    await query.edit_message_text(
+        "📆 <b>Управление неделями</b>\n\n"
+        "Выберите неделю для массового закрытия/открытия:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_weeks_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Navigate schedule weeks pages."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, page_str = query.data.split("|", maxsplit=1)
+    page = int(page_str)
+    schedule_manager.cleanup_past_blocks(datetime.now(timezone))
+    today = datetime.now(timezone).date()
+    weeks: List[Tuple[date, str]] = []
+    for offset in range(0, settings.booking_horizon_days, 7):
+        week_start = today + timedelta(days=offset - today.weekday())
+        week_end = week_start + timedelta(days=6)
+        label = f"{format_day_short(week_start)} - {format_day_short(week_end)}"
+        weeks.append((week_start, label))
+    keyboard = build_schedule_weeks_keyboard(weeks, page=page, page_size=5)
+    await query.edit_message_text(
+        "📆 <b>Управление неделями</b>\n\n"
+        "Выберите неделю для массового закрытия/открытия:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_week_block_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Block entire week."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, week_start_str = query.data.split("|", maxsplit=1)
+    week_start = datetime.strptime(week_start_str, "%Y-%m-%d").date()
+    # Block all days in the week with all time slots
+    days_since_monday = week_start.weekday()
+    monday = week_start - timedelta(days=days_since_monday)
+    for day_offset in range(7):
+        day = monday + timedelta(days=day_offset)
+        if day.weekday() in settings.workdays:
+            schedule_manager.block_day(day.isoformat(), daily_slots)
+    await query.answer("Неделя закрыта ✅", show_alert=True)
+    # Refresh weeks view
+    today = datetime.now(timezone).date()
+    weeks: List[Tuple[date, str]] = []
+    for offset in range(0, settings.booking_horizon_days, 7):
+        ws = today + timedelta(days=offset - today.weekday())
+        we = ws + timedelta(days=6)
+        label = f"{format_day_short(ws)} - {format_day_short(we)}"
+        weeks.append((ws, label))
+    keyboard = build_schedule_weeks_keyboard(weeks, page=0, page_size=5)
+    await query.edit_message_text(
+        "📆 <b>Управление неделями</b>\n\n"
+        "Выберите неделю для массового закрытия/открытия:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_week_unblock_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unblock entire week."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, week_start_str = query.data.split("|", maxsplit=1)
+    week_start = datetime.strptime(week_start_str, "%Y-%m-%d").date()
+    schedule_manager.unblock_week(week_start)
+    await query.answer("Неделя открыта ✅", show_alert=True)
+    # Refresh weeks view
+    today = datetime.now(timezone).date()
+    weeks: List[Tuple[date, str]] = []
+    for offset in range(0, settings.booking_horizon_days, 7):
+        ws = today + timedelta(days=offset - today.weekday())
+        we = ws + timedelta(days=6)
+        label = f"{format_day_short(ws)} - {format_day_short(we)}"
+        weeks.append((ws, label))
+    keyboard = build_schedule_weeks_keyboard(weeks, page=0, page_size=5)
+    await query.edit_message_text(
+        "📆 <b>Управление неделями</b>\n\n"
+        "Выберите неделю для массового закрытия/открытия:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def schedule_work_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show work settings menu."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    has_custom = schedule_manager.get_work_settings() is not None
+    workdays, start_hour, end_hour = get_effective_work_settings()
+    status_text = "Используются настройки по умолчанию" if not has_custom else "Используются пользовательские настройки"
+    await query.edit_message_text(
+        f"⚙️ <b>Настройка рабочего времени</b>\n\n"
+        f"Текущие настройки:\n"
+        f"Дни: {', '.join([WEEKDAYS_RU_SHORT[d] for d in sorted(workdays)])}\n"
+        f"Часы: {start_hour:02d}:00 - {end_hour:02d}:00\n\n"
+        f"{status_text}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_work_settings_keyboard(has_custom),
+    )
+
+
+async def work_settings_days_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show work days selection."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    workdays, _, _ = get_effective_work_settings()
+    # Store current selection in user_data
+    context.user_data["work_days_temp"] = workdays.copy()
+    keyboard = build_work_days_keyboard(workdays)
+    await query.edit_message_text(
+        "📅 <b>Настройка дней недели</b>\n\n"
+        "Выберите рабочие дни (нажмите для переключения):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def work_day_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle a work day."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, day_str = query.data.split("|", maxsplit=1)
+    day_num = int(day_str)
+    if "work_days_temp" not in context.user_data:
+        workdays, _, _ = get_effective_work_settings()
+        context.user_data["work_days_temp"] = workdays.copy()
+    selected = context.user_data["work_days_temp"]
+    if day_num in selected:
+        selected.remove(day_num)
+    else:
+        selected.append(day_num)
+    selected.sort()
+    keyboard = build_work_days_keyboard(selected)
+    await query.edit_message_text(
+        "📅 <b>Настройка дней недели</b>\n\n"
+        "Выберите рабочие дни (нажмите для переключения):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def work_days_apply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Apply work days settings."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    if "work_days_temp" not in context.user_data:
+        await query.answer("Ошибка: настройки не найдены", show_alert=True)
+        return
+    selected_days = context.user_data["work_days_temp"]
+    if not selected_days:
+        await query.answer("Выберите хотя бы один рабочий день", show_alert=True)
+        return
+    _, start_hour, end_hour = get_effective_work_settings()
+    schedule_manager.set_work_settings(selected_days, start_hour, end_hour)
+    refresh_daily_slots()
+    context.user_data.pop("work_days_temp", None)
+    await query.answer("Дни недели обновлены ✅", show_alert=True)
+    # Return to settings menu
+    has_custom = True
+    workdays = selected_days
+    status_text = "Используются пользовательские настройки"
+    await query.edit_message_text(
+        f"⚙️ <b>Настройка рабочего времени</b>\n\n"
+        f"Текущие настройки:\n"
+        f"Дни: {', '.join([WEEKDAYS_RU_SHORT[d] for d in sorted(workdays)])}\n"
+        f"Часы: {start_hour:02d}:00 - {end_hour:02d}:00\n\n"
+        f"{status_text}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_work_settings_keyboard(has_custom),
+    )
+
+
+async def work_settings_hours_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show work hours selection."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, start_hour, end_hour = get_effective_work_settings()
+    # Store in user_data
+    context.user_data["work_start_temp"] = start_hour
+    context.user_data["work_end_temp"] = end_hour
+    keyboard = build_work_hours_keyboard(start_hour, end_hour)
+    await query.edit_message_text(
+        "🕐 <b>Настройка часов работы</b>\n\n"
+        "Выберите время начала и окончания работы:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def work_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set work start hour."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, hour_str = query.data.split("|", maxsplit=1)
+    start_hour = int(hour_str)
+    if "work_end_temp" not in context.user_data:
+        _, _, end_hour = get_effective_work_settings()
+        context.user_data["work_end_temp"] = end_hour
+    end_hour = context.user_data["work_end_temp"]
+    if start_hour >= end_hour:
+        await query.answer("Время начала должно быть раньше времени окончания", show_alert=True)
+        return
+    context.user_data["work_start_temp"] = start_hour
+    keyboard = build_work_hours_keyboard(start_hour, end_hour)
+    await query.edit_message_text(
+        "🕐 <b>Настройка часов работы</b>\n\n"
+        "Выберите время начала и окончания работы:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def work_end_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set work end hour."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, hour_str = query.data.split("|", maxsplit=1)
+    end_hour = int(hour_str)
+    if "work_start_temp" not in context.user_data:
+        _, start_hour, _ = get_effective_work_settings()
+        context.user_data["work_start_temp"] = start_hour
+    start_hour = context.user_data["work_start_temp"]
+    if end_hour <= start_hour:
+        await query.answer("Время окончания должно быть позже времени начала", show_alert=True)
+        return
+    context.user_data["work_end_temp"] = end_hour
+    keyboard = build_work_hours_keyboard(start_hour, end_hour)
+    await query.edit_message_text(
+        "🕐 <b>Настройка часов работы</b>\n\n"
+        "Выберите время начала и окончания работы:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def work_hours_apply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Apply work hours settings."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    if "work_start_temp" not in context.user_data or "work_end_temp" not in context.user_data:
+        await query.answer("Ошибка: настройки не найдены", show_alert=True)
+        return
+    start_hour = context.user_data["work_start_temp"]
+    end_hour = context.user_data["work_end_temp"]
+    if end_hour <= start_hour:
+        await query.answer("Время окончания должно быть позже времени начала", show_alert=True)
+        return
+    workdays, _, _ = get_effective_work_settings()
+    schedule_manager.set_work_settings(workdays, start_hour, end_hour)
+    refresh_daily_slots()
+    context.user_data.pop("work_start_temp", None)
+    context.user_data.pop("work_end_temp", None)
+    await query.answer("Часы работы обновлены ✅", show_alert=True)
+    # Return to settings menu
+    has_custom = True
+    status_text = "Используются пользовательские настройки"
+    await query.edit_message_text(
+        f"⚙️ <b>Настройка рабочего времени</b>\n\n"
+        f"Текущие настройки:\n"
+        f"Дни: {', '.join([WEEKDAYS_RU_SHORT[d] for d in sorted(workdays)])}\n"
+        f"Часы: {start_hour:02d}:00 - {end_hour:02d}:00\n\n"
+        f"{status_text}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_work_settings_keyboard(has_custom),
+    )
+
+
+async def work_settings_reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reset work settings to defaults."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    schedule_manager.clear_work_settings()
+    refresh_daily_slots()
+    await query.answer("Настройки сброшены к значениям по умолчанию ✅", show_alert=True)
+    workdays, start_hour, end_hour = get_effective_work_settings()
+    has_custom = False
+    status_text = "Используются настройки по умолчанию"
+    await query.edit_message_text(
+        f"⚙️ <b>Настройка рабочего времени</b>\n\n"
+        f"Текущие настройки:\n"
+        f"Дни: {', '.join([WEEKDAYS_RU_SHORT[d] for d in sorted(workdays)])}\n"
+        f"Часы: {start_hour:02d}:00 - {end_hour:02d}:00\n\n"
+        f"{status_text}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_work_settings_keyboard(has_custom),
+    )
+
+
+async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send reminders 2 hours before confirmed trainings."""
+    now = datetime.now(timezone)
+    upcoming = store.get_upcoming_confirmed(now)
+    
+    for request in upcoming:
+        try:
+            slot_dt = timezone.localize(
+                datetime.strptime(f"{request.date} {request.time}", "%Y-%m-%d %H:%M")
+            )
+            # Double-check: reminder should be sent exactly 2 hours before
+            reminder_time = slot_dt - timedelta(hours=2)
+            if now < reminder_time or now >= slot_dt:
+                continue
+            
+            slot_text = humanize_slot(request.date, request.time)
+            
+            # Send to client
+            client_message = (
+                f"⏰ Напоминание: через 2 часа у вас индивидуальная тренировка!\n"
+                f"Время: {slot_text}"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=request.user_id,
+                    text=client_message,
+                    reply_markup=build_main_keyboard(request.user_id),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send reminder to client {request.user_id}: {e}")
+            
+            # Send to trainer
+            trainer_message = (
+                f"⏰ Напоминание: через 2 часа индивидуальная тренировка!\n"
+                f"Время: {slot_text}\n"
+                f"Клиент: {request.full_name} (@{request.username or 'нет'})"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=settings.instructor_chat_id,
+                    text=trainer_message,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send reminder to trainer: {e}")
+            
+            # Mark as sent
+            store.mark_reminder_sent(request.id)
+            logger.info(f"Reminder sent for request {request.id} ({slot_text})")
+            
+        except Exception as e:
+            logger.error(f"Error processing reminder for request {request.id}: {e}")
+
+
 def main() -> None:
     application = Application.builder().token(settings.bot_token).build()
 
@@ -821,6 +1463,29 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(cancel_without_reason_callback, pattern=r"^CANCEL_SKIP\|"))
     application.add_handler(CallbackQueryHandler(admin_cancel_without_reason_callback, pattern=r"^ADMIN_CANCEL_SKIP\|"))
     application.add_handler(CallbackQueryHandler(ignore_callback, pattern=r"^IGNORE$"))
+    # Schedule management handlers
+    application.add_handler(CallbackQueryHandler(schedule_menu_callback, pattern=r"^SCHEDULE_MENU$"))
+    application.add_handler(CallbackQueryHandler(schedule_menu_callback, pattern=r"^SCHEDULE_BACK$"))
+    application.add_handler(CallbackQueryHandler(schedule_days_callback, pattern=r"^SCHEDULE_DAYS$"))
+    application.add_handler(CallbackQueryHandler(schedule_days_page_callback, pattern=r"^SCHEDULE_DAYS_PAGE\|"))
+    application.add_handler(CallbackQueryHandler(schedule_day_callback, pattern=r"^SCHEDULE_DAY\|"))
+    application.add_handler(CallbackQueryHandler(schedule_slot_callback, pattern=r"^SCHEDULE_SLOT\|"))
+    application.add_handler(CallbackQueryHandler(schedule_day_block_callback, pattern=r"^SCHEDULE_DAY_BLOCK\|"))
+    application.add_handler(CallbackQueryHandler(schedule_day_unblock_callback, pattern=r"^SCHEDULE_DAY_UNBLOCK\|"))
+    application.add_handler(CallbackQueryHandler(schedule_weeks_callback, pattern=r"^SCHEDULE_WEEKS$"))
+    application.add_handler(CallbackQueryHandler(schedule_weeks_page_callback, pattern=r"^SCHEDULE_WEEKS_PAGE\|"))
+    application.add_handler(CallbackQueryHandler(schedule_week_block_callback, pattern=r"^SCHEDULE_WEEK_BLOCK\|"))
+    application.add_handler(CallbackQueryHandler(schedule_week_unblock_callback, pattern=r"^SCHEDULE_WEEK_UNBLOCK\|"))
+    # Work settings handlers
+    application.add_handler(CallbackQueryHandler(schedule_work_settings_callback, pattern=r"^SCHEDULE_WORK_SETTINGS$"))
+    application.add_handler(CallbackQueryHandler(work_settings_days_callback, pattern=r"^WORK_SETTINGS_DAYS$"))
+    application.add_handler(CallbackQueryHandler(work_day_toggle_callback, pattern=r"^WORK_DAY_TOGGLE\|"))
+    application.add_handler(CallbackQueryHandler(work_days_apply_callback, pattern=r"^WORK_DAYS_APPLY$"))
+    application.add_handler(CallbackQueryHandler(work_settings_hours_callback, pattern=r"^WORK_SETTINGS_HOURS$"))
+    application.add_handler(CallbackQueryHandler(work_start_callback, pattern=r"^WORK_START\|"))
+    application.add_handler(CallbackQueryHandler(work_end_callback, pattern=r"^WORK_END\|"))
+    application.add_handler(CallbackQueryHandler(work_hours_apply_callback, pattern=r"^WORK_HOURS_APPLY$"))
+    application.add_handler(CallbackQueryHandler(work_settings_reset_callback, pattern=r"^WORK_SETTINGS_RESET$"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
@@ -829,6 +1494,16 @@ def main() -> None:
             menu_text_handler,
         )
     )
+
+    # Schedule reminder job to run every 5 minutes
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(
+            send_reminders,
+            interval=300,  # 5 minutes
+            first=10,  # Start after 10 seconds
+        )
+        logger.info("Reminder job scheduled (runs every 5 minutes)")
 
     application.run_polling(drop_pending_updates=True)
 

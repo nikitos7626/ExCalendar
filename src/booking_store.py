@@ -4,7 +4,7 @@ import json
 import threading
 import uuid
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -19,6 +19,7 @@ class BookingRequest:
     time: str  # HH:MM
     status: str  # pending|confirmed|declined|cancelled_by_client|cancelled_by_trainer
     created_at: str
+    reminder_sent: bool = False  # Whether 2-hour reminder was sent
 
 
 class BookingStore:
@@ -76,6 +77,7 @@ class BookingStore:
                 time=time_str,
                 status="pending",
                 created_at=datetime.utcnow().isoformat(),
+                reminder_sent=False,
             )
             self._data["requests"].append(asdict(request))
             self._flush()
@@ -93,6 +95,9 @@ class BookingStore:
     def get_request(self, request_id: str) -> BookingRequest:
         for item in self._data["requests"]:
             if item["id"] == request_id:
+                # Handle old records without reminder_sent field
+                if "reminder_sent" not in item:
+                    item["reminder_sent"] = False
                 return BookingRequest(**item)
         raise KeyError(request_id)
 
@@ -105,18 +110,56 @@ class BookingStore:
         return result
 
     def list_user_requests(self, user_id: int) -> List[BookingRequest]:
-        requests = [
-            BookingRequest(**item)
-            for item in self._data["requests"]
-            if item["user_id"] == user_id
-        ]
+        requests = []
+        for item in self._data["requests"]:
+            if item["user_id"] == user_id:
+                # Handle old records without reminder_sent field
+                if "reminder_sent" not in item:
+                    item["reminder_sent"] = False
+                requests.append(BookingRequest(**item))
         requests.sort(key=lambda r: (r.date, r.time))
         return requests
 
     def list_all_requests(self) -> List[BookingRequest]:
-        requests = [BookingRequest(**item) for item in self._data["requests"]]
+        requests = []
+        for item in self._data["requests"]:
+            # Handle old records without reminder_sent field
+            if "reminder_sent" not in item:
+                item["reminder_sent"] = False
+            requests.append(BookingRequest(**item))
         requests.sort(key=lambda r: (r.date, r.time))
         return requests
+
+    def get_upcoming_confirmed(self, now: datetime) -> List[BookingRequest]:
+        """Get confirmed requests that need reminder (2 hours before start)."""
+        result = []
+        for item in self._data["requests"]:
+            if item["status"] != "confirmed":
+                continue
+            if item.get("reminder_sent", False):
+                continue
+            # Handle old records
+            if "reminder_sent" not in item:
+                item["reminder_sent"] = False
+            try:
+                slot_dt = datetime.strptime(f"{item['date']} {item['time']}", "%Y-%m-%d %H:%M")
+                # Check if reminder time (2 hours before) has passed
+                reminder_time = slot_dt - timedelta(hours=2)
+                if now >= reminder_time and now < slot_dt:
+                    result.append(BookingRequest(**item))
+            except (ValueError, KeyError):
+                continue
+        return result
+
+    def mark_reminder_sent(self, request_id: str) -> None:
+        """Mark reminder as sent for a request."""
+        with self._lock:
+            for item in self._data["requests"]:
+                if item["id"] == request_id:
+                    item["reminder_sent"] = True
+                    self._flush()
+                    return
+        raise KeyError(f"Request {request_id} not found")
 
     def cleanup_expired(self, now: datetime) -> None:
         """Remove requests that finished before 'now'."""

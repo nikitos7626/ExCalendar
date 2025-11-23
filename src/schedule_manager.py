@@ -17,6 +17,8 @@ class ScheduleManager:
         self._data: Dict = {
             "blocked_slots": {},  # {"YYYY-MM-DD": ["HH:MM", ...]}
             "work_settings": None,  # {"workdays": [0,1,2,3,4], "work_start_hour": 8, "work_end_hour": 22}
+            "regular_clients": [],  # [{"user_id": int, "username": str, "full_name": str}, ...]
+            "group_slots": [],  # [{"weekday": int, "time": "HH:MM"}, ...] - слоты где можно записываться >1 человеку
         }
         self._load()
 
@@ -25,9 +27,18 @@ class ScheduleManager:
             with self.storage_path.open("r", encoding="utf-8") as f:
                 loaded = json.load(f)
                 # Merge with defaults to handle old files
+                regular_clients = loaded.get("regular_clients", [])
+                # Migrate old regular clients format (add weekday and time if missing)
+                for client in regular_clients:
+                    if "weekday" not in client:
+                        client["weekday"] = None
+                    if "time" not in client:
+                        client["time"] = None
                 self._data = {
                     "blocked_slots": loaded.get("blocked_slots", {}),
                     "work_settings": loaded.get("work_settings"),
+                    "regular_clients": regular_clients,
+                    "group_slots": loaded.get("group_slots", []),
                 }
         else:
             self._flush()
@@ -156,4 +167,123 @@ class ScheduleManager:
         with self._lock:
             self._data["work_settings"] = None
             self._flush()
+
+    def get_regular_clients(self) -> List[Dict]:
+        """Get list of regular clients."""
+        return self._data.get("regular_clients", []).copy()
+
+    def add_regular_client(self, user_id: int, username: str, full_name: str) -> None:
+        """Add a client to regular clients list."""
+        with self._lock:
+            if "regular_clients" not in self._data:
+                self._data["regular_clients"] = []
+            # Check if already exists
+            if not any(c["user_id"] == user_id for c in self._data["regular_clients"]):
+                self._data["regular_clients"].append({
+                    "user_id": user_id,
+                    "username": username or "",
+                    "full_name": full_name,
+                    "weekday": None,  # 0-6, None if not set
+                    "time": None,  # HH:MM, None if not set
+                })
+                self._flush()
+
+    def remove_regular_client(self, user_id: int) -> None:
+        """Remove a client from regular clients list."""
+        with self._lock:
+            if "regular_clients" not in self._data:
+                return
+            self._data["regular_clients"] = [
+                c for c in self._data["regular_clients"] if c["user_id"] != user_id
+            ]
+            self._flush()
+
+    def is_regular_client(self, user_id: int) -> bool:
+        """Check if user is a regular client."""
+        return any(c["user_id"] == user_id for c in self._data.get("regular_clients", []))
+
+    def set_regular_client_slot(self, user_id: int, weekday: int, time_str: str) -> None:
+        """Set fixed slot (weekday + time) for a regular client."""
+        with self._lock:
+            if "regular_clients" not in self._data:
+                return
+            for client in self._data["regular_clients"]:
+                if client["user_id"] == user_id:
+                    client["weekday"] = weekday
+                    client["time"] = time_str
+                    self._flush()
+                    return
+
+    def clear_regular_client_slot(self, user_id: int) -> None:
+        """Clear fixed slot for a regular client."""
+        with self._lock:
+            if "regular_clients" not in self._data:
+                return
+            for client in self._data["regular_clients"]:
+                if client["user_id"] == user_id:
+                    client["weekday"] = None
+                    client["time"] = None
+                    self._flush()
+                    return
+
+    def get_regular_client_slot(self, user_id: int) -> Dict | None:
+        """Get fixed slot for a regular client. Returns None if not set."""
+        for client in self._data.get("regular_clients", []):
+            if client["user_id"] == user_id:
+                if client.get("weekday") is not None and client.get("time"):
+                    return {"weekday": client["weekday"], "time": client["time"]}
+        return None
+
+    def get_all_regular_client_slots(self) -> List[Dict]:
+        """Get all regular clients with their fixed slots."""
+        result = []
+        for client in self._data.get("regular_clients", []):
+            if client.get("weekday") is not None and client.get("time"):
+                result.append({
+                    "user_id": client["user_id"],
+                    "username": client.get("username", ""),
+                    "full_name": client.get("full_name", ""),
+                    "weekday": client["weekday"],
+                    "time": client["time"],
+                })
+        return result
+
+    def get_group_slots(self) -> List[Dict]:
+        """Get list of group slots (weekday + time where multiple bookings allowed)."""
+        return self._data.get("group_slots", []).copy()
+
+    def add_group_slot(self, weekday: int, time_str: str) -> None:
+        """Add a group slot (weekday 0-6, time HH:MM)."""
+        with self._lock:
+            if "group_slots" not in self._data:
+                self._data["group_slots"] = []
+            slot = {"weekday": weekday, "time": time_str}
+            # Check if already exists
+            if slot not in self._data["group_slots"]:
+                self._data["group_slots"].append(slot)
+                self._flush()
+
+    def remove_group_slot(self, weekday: int, time_str: str) -> None:
+        """Remove a group slot."""
+        with self._lock:
+            if "group_slots" not in self._data:
+                return
+            self._data["group_slots"] = [
+                s for s in self._data["group_slots"]
+                if not (s["weekday"] == weekday and s["time"] == time_str)
+            ]
+            self._flush()
+
+    def is_group_slot(self, date_str: str, time_str: str) -> bool:
+        """Check if a specific date+time is a group slot."""
+        from datetime import datetime
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            weekday = dt.weekday()
+            for slot in self._data.get("group_slots", []):
+                if slot["weekday"] == weekday and slot["time"] == time_str:
+                    return True
+        except (ValueError, KeyError):
+            pass
+        return False
 

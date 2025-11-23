@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -10,6 +10,7 @@ def build_dates_keyboard(
     dates: List[Tuple[date, str]],
     page: int,
     page_size: int,
+    group_dates: set[str] | None = None,
 ) -> InlineKeyboardMarkup:
     buttons: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
@@ -18,8 +19,14 @@ def build_dates_keyboard(
     end = start + page_size
     slice_items = dates[start:end]
 
+    group_dates = group_dates or set()
     for day, label in slice_items:
-        row.append(InlineKeyboardButton(label, callback_data=f"DATE|{day.isoformat()}"))
+        # Mark group slots with emoji
+        if day.isoformat() in group_dates:
+            display_label = f"👥 {label}"
+        else:
+            display_label = label
+        row.append(InlineKeyboardButton(display_label, callback_data=f"DATE|{day.isoformat()}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -43,13 +50,19 @@ def build_dates_keyboard(
     return InlineKeyboardMarkup(buttons)
 
 
-def build_times_keyboard(date_str: str, times: Iterable[str], back_page: int) -> InlineKeyboardMarkup:
+def build_times_keyboard(date_str: str, times: Iterable[str], back_page: int, group_times: set[str] | None = None) -> InlineKeyboardMarkup:
     buttons: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
+    group_times = group_times or set()
     for time_str in times:
+        # Mark group slots with emoji
+        if time_str in group_times:
+            display_time = f"👥 {time_str}"
+        else:
+            display_time = time_str
         row.append(
             InlineKeyboardButton(
-                time_str,
+                display_time,
                 callback_data=f"TIME|{date_str}|{time_str}",
             )
         )
@@ -80,6 +93,20 @@ def build_request_review_keyboard(request_id: str) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def build_pending_requests_keyboard(options: Iterable[Tuple[str, str]]) -> InlineKeyboardMarkup:
+    buttons: List[List[InlineKeyboardButton]] = []
+    for request_id, label in options:
+        buttons.append(
+            [
+                InlineKeyboardButton(f"✅ {label}", callback_data=f"REVIEW|{request_id}|approve"),
+                InlineKeyboardButton("❌", callback_data=f"REVIEW|{request_id}|decline"),
+            ]
+        )
+    if not buttons:
+        buttons = [[InlineKeyboardButton("Нет заявок", callback_data="IGNORE")]]
+    return InlineKeyboardMarkup(buttons)
 
 
 def build_decline_reason_keyboard(request_id: str) -> InlineKeyboardMarkup:
@@ -150,6 +177,8 @@ def build_schedule_manage_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📅 Управление днями", callback_data="SCHEDULE_DAYS")],
             [InlineKeyboardButton("📆 Управление неделями", callback_data="SCHEDULE_WEEKS")],
             [InlineKeyboardButton("⚙️ Настройка рабочего времени", callback_data="SCHEDULE_WORK_SETTINGS")],
+            [InlineKeyboardButton("👥 Постоянные клиенты", callback_data="REGULAR_CLIENTS")],
+            [InlineKeyboardButton("👥 Групповые слоты", callback_data="GROUP_SLOTS")],
             [InlineKeyboardButton("↩️ Назад", callback_data="SCHEDULE_BACK")],
         ]
     )
@@ -335,5 +364,211 @@ def build_work_hours_keyboard(start_hour: int, end_hour: int) -> InlineKeyboardM
     
     buttons.append([InlineKeyboardButton("✅ Применить", callback_data="WORK_HOURS_APPLY")])
     buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="SCHEDULE_WORK_SETTINGS")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_regular_clients_keyboard(clients: List[Dict]) -> InlineKeyboardMarkup:
+    """Build keyboard for managing regular clients."""
+    buttons: List[List[InlineKeyboardButton]] = []
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    for client in clients:
+        label = f"{client.get('full_name', 'Unknown')} (@{client.get('username', 'no_username')})"
+        weekday = client.get("weekday")
+        time_str = client.get("time")
+        if weekday is not None and time_str:
+            slot_info = f" · {weekdays[weekday]} {time_str}"
+        else:
+            slot_info = " · не назначено"
+        buttons.append([
+            InlineKeyboardButton(
+                f"📅 {label}{slot_info}",
+                callback_data=f"REGULAR_CLIENT_SLOT|{client['user_id']}",
+            )
+        ])
+        buttons.append([
+            InlineKeyboardButton(
+                f"❌ Удалить",
+                callback_data=f"REMOVE_CLIENT|{client['user_id']}",
+            )
+        ])
+    if not buttons:
+        buttons = [[InlineKeyboardButton("Нет постоянных клиентов", callback_data="IGNORE")]]
+    buttons.append([InlineKeyboardButton("➕ Добавить клиента", callback_data="ADD_REGULAR_CLIENT")])
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="SCHEDULE_MENU")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_add_regular_client_keyboard(clients: List[Dict]) -> InlineKeyboardMarkup:
+    """Build keyboard for selecting clients to add as regular."""
+    buttons: List[List[InlineKeyboardButton]] = []
+    for client in clients:
+        label = f"{client.get('full_name', 'Unknown')} (@{client.get('username', 'no_username')})"
+        buttons.append([
+            InlineKeyboardButton(
+                f"➕ {label}",
+                callback_data=f"ADD_CLIENT|{client['user_id']}",
+            )
+        ])
+    if not buttons:
+        buttons = [[InlineKeyboardButton("Нет доступных клиентов", callback_data="IGNORE")]]
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="REGULAR_CLIENTS")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_group_slots_keyboard(group_slots: List[Dict], times: List[str]) -> InlineKeyboardMarkup:
+    """Build keyboard for managing group slots."""
+    buttons: List[List[InlineKeyboardButton]] = []
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    
+    # Show existing group slots
+    for slot in group_slots:
+        weekday = slot["weekday"]
+        time_str = slot["time"]
+        label = f"{weekdays[weekday]} {time_str}"
+        buttons.append([
+            InlineKeyboardButton(
+                f"❌ {label}",
+                callback_data=f"REMOVE_GROUP_SLOT|{weekday}|{time_str}",
+            )
+        ])
+    
+    if not buttons:
+        buttons = [[InlineKeyboardButton("Нет групповых слотов", callback_data="IGNORE")]]
+    
+    buttons.append([InlineKeyboardButton("➕ Добавить групповой слот", callback_data="ADD_GROUP_SLOT")])
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="SCHEDULE_MENU")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_add_group_slot_weekday_keyboard() -> InlineKeyboardMarkup:
+    """Build keyboard for selecting weekday for group slot."""
+    weekdays = [
+        ("Пн", 0),
+        ("Вт", 1),
+        ("Ср", 2),
+        ("Чт", 3),
+        ("Пт", 4),
+        ("Сб", 5),
+        ("Вс", 6),
+    ]
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for label, day_num in weekdays:
+        row.append(
+            InlineKeyboardButton(
+                label,
+                callback_data=f"GROUP_SLOT_WEEKDAY|{day_num}",
+            )
+        )
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="GROUP_SLOTS")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_add_group_slot_time_keyboard(weekday: int, times: List[str]) -> InlineKeyboardMarkup:
+    """Build keyboard for selecting time for group slot."""
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for time_str in times:
+        row.append(
+            InlineKeyboardButton(
+                time_str,
+                callback_data=f"GROUP_SLOT_TIME|{weekday}|{time_str}",
+            )
+        )
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="ADD_GROUP_SLOT")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_regular_client_slot_keyboard(user_id: int, weekday: int | None, time_str: str | None) -> InlineKeyboardMarkup:
+    """Build keyboard for managing regular client slot."""
+    buttons: List[List[InlineKeyboardButton]] = []
+    if weekday is not None and time_str:
+        weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        buttons.append([
+            InlineKeyboardButton(
+                f"📅 Текущий слот: {weekdays[weekday]} {time_str}",
+                callback_data="IGNORE",
+            )
+        ])
+        buttons.append([
+            InlineKeyboardButton(
+                "🔄 Изменить слот",
+                callback_data=f"REGULAR_CLIENT_SET_WEEKDAY|{user_id}",
+            )
+        ])
+        buttons.append([
+            InlineKeyboardButton(
+                "❌ Удалить слот",
+                callback_data=f"REGULAR_CLIENT_CLEAR_SLOT|{user_id}",
+            )
+        ])
+    else:
+        buttons.append([
+            InlineKeyboardButton(
+                "➕ Назначить слот",
+                callback_data=f"REGULAR_CLIENT_SET_WEEKDAY|{user_id}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="REGULAR_CLIENTS")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_regular_client_weekday_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Build keyboard for selecting weekday for regular client slot."""
+    weekdays = [
+        ("Пн", 0),
+        ("Вт", 1),
+        ("Ср", 2),
+        ("Чт", 3),
+        ("Пт", 4),
+        ("Сб", 5),
+        ("Вс", 6),
+    ]
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for label, day_num in weekdays:
+        row.append(
+            InlineKeyboardButton(
+                label,
+                callback_data=f"REGULAR_CLIENT_WEEKDAY|{user_id}|{day_num}",
+            )
+        )
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data=f"REGULAR_CLIENT_SLOT|{user_id}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_regular_client_time_keyboard(user_id: int, weekday: int, times: List[str]) -> InlineKeyboardMarkup:
+    """Build keyboard for selecting time for regular client slot."""
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for time_str in times:
+        row.append(
+            InlineKeyboardButton(
+                time_str,
+                callback_data=f"REGULAR_CLIENT_TIME|{user_id}|{weekday}|{time_str}",
+            )
+        )
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data=f"REGULAR_CLIENT_SET_WEEKDAY|{user_id}")])
     return InlineKeyboardMarkup(buttons)
 

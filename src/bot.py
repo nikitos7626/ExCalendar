@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, time, timedelta
 from typing import Dict, Iterable, List, Tuple
@@ -23,10 +24,19 @@ from .schedule_manager import ScheduleManager
 from .keyboards import (
     build_admin_cancel_keyboard,
     build_admin_cancel_reason_keyboard,
+    build_add_group_slot_time_keyboard,
+    build_add_group_slot_weekday_keyboard,
+    build_add_regular_client_keyboard,
     build_cancel_reason_keyboard,
     build_cancel_select_keyboard,
     build_dates_keyboard,
     build_decline_reason_keyboard,
+    build_group_slots_keyboard,
+    build_pending_requests_keyboard,
+    build_regular_client_slot_keyboard,
+    build_regular_client_time_keyboard,
+    build_regular_client_weekday_keyboard,
+    build_regular_clients_keyboard,
     build_request_review_keyboard,
     build_schedule_day_times_keyboard,
     build_schedule_days_keyboard,
@@ -65,7 +75,26 @@ DATES_PAGE_SIZE = 6
 
 
 def is_instructor(user_id: int) -> bool:
-    return user_id == settings.instructor_chat_id
+    return user_id in settings.instructor_chat_ids
+
+
+async def send_to_all_instructors(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    parse_mode: str | None = None,
+    reply_markup=None,
+) -> None:
+    """Send message to all instructors/admins."""
+    for chat_id in settings.instructor_chat_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send message to instructor {chat_id}: {e}")
 
 
 def build_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
@@ -151,14 +180,17 @@ def refresh_daily_slots() -> None:
 daily_slots = _generate_daily_slots()
 
 
-def collect_available_dates_with_labels() -> List[Tuple[date, str]]:
+def collect_available_dates_with_labels() -> Tuple[List[Tuple[date, str]], set[str]]:
     cleanup_expired_requests()
     schedule_manager.cleanup_past_blocks(datetime.now(timezone))
     refresh_daily_slots()  # Refresh in case settings changed
     workdays, _, _ = get_effective_work_settings()
     today = datetime.now(timezone).date()
     result: List[Tuple[date, str]] = []
+    group_dates: set[str] = set()
     blocked_dates = schedule_manager.get_all_blocked_dates()
+    group_slots = schedule_manager.get_group_slots()
+    
     for offset in range(settings.booking_horizon_days):
         candidate = today + timedelta(days=offset)
         if candidate.weekday() in workdays:
@@ -168,7 +200,13 @@ def collect_available_dates_with_labels() -> List[Tuple[date, str]]:
             # If day is not fully blocked, include it
             if len(blocked_slots) < len(daily_slots):
                 result.append((candidate, format_day_short(candidate)))
-    return result
+                # Check if this date has any group slots
+                weekday = candidate.weekday()
+                for slot in group_slots:
+                    if slot["weekday"] == weekday:
+                        group_dates.add(date_str)
+                        break
+    return result, group_dates
 
 
 def format_day_short(day: date) -> str:
@@ -179,8 +217,8 @@ def format_day_full(day: date) -> str:
     return f"{day.day:02d} {MONTHS_RU_GEN[day.month - 1]} ({WEEKDAYS_RU_FULL[day.weekday()]})"
 
 
-def find_dates_and_page(date_str: str) -> Tuple[List[Tuple[date, str]], int, bool]:
-    dates = collect_available_dates_with_labels()
+def find_dates_and_page(date_str: str) -> Tuple[List[Tuple[date, str]], int, bool, set[str]]:
+    dates, group_dates = collect_available_dates_with_labels()
     page = 0
     found = False
     for idx, (day, _) in enumerate(dates):
@@ -188,7 +226,7 @@ def find_dates_and_page(date_str: str) -> Tuple[List[Tuple[date, str]], int, boo
             page = idx // DATES_PAGE_SIZE
             found = True
             break
-    return dates, page, found
+    return dates, page, found, group_dates
 
 
 def humanize_slot(date_str: str, time_str: str) -> str:
@@ -241,16 +279,16 @@ async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=build_main_keyboard(user.id),
         )
         return
-    dates = collect_available_dates_with_labels()
+    dates, group_dates = collect_available_dates_with_labels()
     if not dates:
         await update.message.reply_text(
             "На ближайшее время нет рабочих дней для записи. Попробуйте позже.",
             reply_markup=build_main_keyboard(user.id),
         )
         return
-    keyboard = build_dates_keyboard(dates, page=0, page_size=DATES_PAGE_SIZE)
+    keyboard = build_dates_keyboard(dates, page=0, page_size=DATES_PAGE_SIZE, group_dates=group_dates)
     await update.message.reply_text(
-        "Выбери подходящий день:",
+        "Выбери подходящий день:\n👥 — групповой слот (можно записаться нескольким)",
         reply_markup=keyboard,
     )
 
@@ -294,8 +332,10 @@ async def show_instructor_bookings(update: Update, context: ContextTypes.DEFAULT
     now = datetime.now(timezone)
     lines: List[str] = []
     options: List[Tuple[str, str]] = []
+    pending_actions: List[Tuple[str, str]] = []
     for req in requests:
         slot_dt = timezone.localize(datetime.strptime(f"{req.date} {req.time}", "%Y-%m-%d %H:%M"))
+        slot_label_short = f"{format_day_short(slot_dt.date())} · {slot_dt.strftime('%H:%M')}"
         if slot_dt < now:
             continue
         status = STATUS_BADGES.get(req.status, req.status)
@@ -303,6 +343,9 @@ async def show_instructor_bookings(update: Update, context: ContextTypes.DEFAULT
         if req.status in TRAINER_CANCELABLE_STATUSES:
             label = f"{humanize_slot(req.date, req.time)} · {req.full_name}"
             options.append((req.id, label))
+        if req.status == "pending":
+            label = f"{slot_label_short} · {req.full_name}"
+            pending_actions.append((req.id, label))
     if lines:
         await update.message.reply_text(
             "\n".join(lines),
@@ -312,6 +355,11 @@ async def show_instructor_bookings(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(
             "Нет активных записей. Заявки появятся после выбора времени клиентом.",
             reply_markup=build_main_keyboard(update.effective_user.id),
+        )
+    if pending_actions:
+        await update.message.reply_text(
+            "Выбери заявку, чтобы подтвердить или отклонить её:",
+            reply_markup=build_pending_requests_keyboard(pending_actions),
         )
     if options:
         await update.message.reply_text(
@@ -325,26 +373,37 @@ async def date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
 
     _, date_str = query.data.split("|", maxsplit=1)
-    dates, page, found = find_dates_and_page(date_str)
+    dates, page, found, group_dates = find_dates_and_page(date_str)
     if not found:
         await query.edit_message_text(
             "Эта дата больше недоступна. Выберите заново:",
-            reply_markup=build_dates_keyboard(dates, page=0, page_size=DATES_PAGE_SIZE),
+            reply_markup=build_dates_keyboard(dates, page=0, page_size=DATES_PAGE_SIZE, group_dates=group_dates),
         )
         return
     day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
     busy_map = store.list_day_states(date_str)
     blocked_slots = set(schedule_manager.get_blocked_slots_for_day(date_str))
-    free_slots = [
-        slot
-        for slot in daily_slots
-        if slot not in busy_map
-        and busy_map.get(slot) not in {"pending", "confirmed"}
-        and slot not in blocked_slots
-    ]
-    keyboard = build_times_keyboard(date_str, free_slots, back_page=page)
+    
+    # Get group times for this date
+    dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+    weekday = dt.weekday()
+    group_slots = schedule_manager.get_group_slots()
+    group_times = {slot["time"] for slot in group_slots if slot["weekday"] == weekday}
+    
+    free_slots = []
+    for slot in daily_slots:
+        if slot in blocked_slots:
+            continue
+        # For group slots, allow multiple bookings
+        if slot in group_times:
+            free_slots.append(slot)
+        # For regular slots, check if already booked
+        elif slot not in busy_map or busy_map.get(slot) not in {"pending", "confirmed"}:
+            free_slots.append(slot)
+    
+    keyboard = build_times_keyboard(date_str, free_slots, back_page=page, group_times=group_times)
     await query.edit_message_text(
-        text=f"Свободные часы на {day_label}:",
+        text=f"Свободные часы на {day_label}:\n👥 — групповой слот (можно записаться нескольким)",
         reply_markup=keyboard,
     )
 
@@ -354,7 +413,7 @@ async def back_to_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
     parts = query.data.split("|", maxsplit=1)
     page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-    dates = collect_available_dates_with_labels()
+    dates, group_dates = collect_available_dates_with_labels()
     max_page = max((len(dates) - 1) // DATES_PAGE_SIZE, 0)
     page = max(0, min(page, max_page))
     if not dates:
@@ -364,8 +423,8 @@ async def back_to_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
     await query.edit_message_text(
-        "Выбери подходящий день:",
-        reply_markup=build_dates_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE),
+        "Выбери подходящий день:\n👥 — групповой слот (можно записаться нескольким)",
+        reply_markup=build_dates_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE, group_dates=group_dates),
     )
 
 
@@ -382,14 +441,17 @@ async def time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Check if slot is blocked
     if schedule_manager.is_slot_blocked(date_str, time_str):
         await query.answer("Этот слот закрыт для записи тренером", show_alert=True)
-        dates, page, _ = find_dates_and_page(date_str)
+        dates, page, _, group_dates = find_dates_and_page(date_str)
         await query.edit_message_text(
             "Этот слот закрыт. Выбери другую дату:",
-            reply_markup=build_dates_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE),
+            reply_markup=build_dates_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE, group_dates=group_dates),
         )
         return
 
-    dates, page, _ = find_dates_and_page(date_str)
+    # Check if it's a group slot
+    is_group_slot = schedule_manager.is_group_slot(date_str, time_str)
+    
+    dates, page, _, group_dates = find_dates_and_page(date_str)
     user = query.from_user
     try:
         request = store.create_request(
@@ -398,32 +460,50 @@ async def time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             full_name=user.full_name,
             date_str=date_str,
             time_str=time_str,
+            is_group_slot=is_group_slot,
         )
     except ValueError:
         await query.answer("Слот уже занят. Выбери другой.", show_alert=True)
         await query.edit_message_text(
             "Этот час уже занят. Выбери другую дату:",
-            reply_markup=build_dates_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE),
+            reply_markup=build_dates_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE, group_dates=group_dates),
         )
         return
 
+    slot_type = "групповой слот" if is_group_slot else "индивидуальный слот"
     await query.edit_message_text(
-        f"Запрос на {humanize_slot(date_str, time_str)} отправлен тренеру.\n"
+        f"Запрос на {humanize_slot(date_str, time_str)} ({slot_type}) отправлен тренеру.\n"
         "Я напомню, когда он подтвердит запись."
     )
 
+    bookings_count = store.get_slot_bookings_count(date_str, time_str)
     admin_text = (
         "<b>Новая заявка</b>\n"
         f"Дата: {humanize_slot(date_str, time_str)}\n"
+        f"Тип: {slot_type}\n"
         f"Клиент: {user.full_name} "
         f"(@{user.username or 'нет'} | id {user.id})"
     )
-    message = await context.bot.send_message(
-        chat_id=settings.instructor_chat_id,
-        text=admin_text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=build_request_review_keyboard(request.id),
-    )
+    if is_group_slot:
+        admin_text += f"\nЗаписей на этот слот: {bookings_count}"
+    # Send to first instructor with keyboard, others without
+    if settings.instructor_chat_ids:
+        await context.bot.send_message(
+            chat_id=settings.instructor_chat_ids[0],
+            text=admin_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_request_review_keyboard(request.id),
+        )
+        # Send to other instructors without keyboard
+        for chat_id in settings.instructor_chat_ids[1:]:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=admin_text,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send message to instructor {chat_id}: {e}")
 
 
 async def cancel_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -487,7 +567,7 @@ async def dates_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     _, page_str = query.data.split("|", maxsplit=1)
     page = int(page_str) if page_str.isdigit() else 0
-    dates = collect_available_dates_with_labels()
+    dates, group_dates = collect_available_dates_with_labels()
     max_page = max((len(dates) - 1) // DATES_PAGE_SIZE, 0)
     page = max(0, min(page, max_page))
     if not dates:
@@ -497,14 +577,14 @@ async def dates_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     await query.edit_message_text(
-        "Выбери подходящий день:",
-        reply_markup=build_dates_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE),
+        "Выбери подходящий день:\n👥 — групповой слот (можно записаться нескольким)",
+        reply_markup=build_dates_keyboard(dates, page=page, page_size=DATES_PAGE_SIZE, group_dates=group_dates),
     )
 
 
 async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if query.from_user.id != settings.instructor_chat_id:
+    if not is_instructor(query.from_user.id):
         await query.answer("Только тренер может управлять заявками", show_alert=True)
         return
 
@@ -547,7 +627,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def decline_without_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if query.from_user.id != settings.instructor_chat_id:
+    if not is_instructor(query.from_user.id):
         await query.answer("Недостаточно прав", show_alert=True)
         return
     await query.answer()
@@ -799,9 +879,9 @@ async def finalize_client_cancel(
     )
     if reason:
         admin_text += f"\nПричина клиента: {reason}"
-    await context.bot.send_message(
-        chat_id=settings.instructor_chat_id,
-        text=admin_text,
+    await send_to_all_instructors(
+        context,
+        admin_text,
         parse_mode=ParseMode.HTML,
     )
 
@@ -847,9 +927,9 @@ async def finalize_trainer_cancel(
     )
     if reason:
         admin_text += f"\nПричина: {reason}"
-    await context.bot.send_message(
-        chat_id=settings.instructor_chat_id,
-        text=admin_text,
+    await send_to_all_instructors(
+        context,
+        admin_text,
         parse_mode=ParseMode.HTML,
     )
 
@@ -898,7 +978,7 @@ async def schedule_days_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
     await query.answer()
     schedule_manager.cleanup_past_blocks(datetime.now(timezone))
-    dates = collect_available_dates_with_labels()
+    dates, _ = collect_available_dates_with_labels()
     # Also include fully blocked days for unblocking
     today = datetime.now(timezone).date()
     blocked_dates = schedule_manager.get_all_blocked_dates()
@@ -930,7 +1010,7 @@ async def schedule_days_page_callback(update: Update, context: ContextTypes.DEFA
     _, page_str = query.data.split("|", maxsplit=1)
     page = int(page_str)
     schedule_manager.cleanup_past_blocks(datetime.now(timezone))
-    dates = collect_available_dates_with_labels()
+    dates, _ = collect_available_dates_with_labels()
     today = datetime.now(timezone).date()
     blocked_dates = schedule_manager.get_all_blocked_dates()
     for offset in range(settings.booking_horizon_days):
@@ -1391,6 +1471,460 @@ async def work_settings_reset_callback(update: Update, context: ContextTypes.DEF
     )
 
 
+async def regular_clients_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show regular clients management."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    clients = schedule_manager.get_regular_clients()
+    keyboard = build_regular_clients_keyboard(clients)
+    await query.edit_message_text(
+        "👥 <b>Постоянные клиенты</b>\n\n"
+        "Список постоянных клиентов. Вы можете назначить фиксированный слот (день недели + время) для каждого клиента.\n"
+        "Клиент будет автоматически занимать этот слот каждую неделю.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def add_regular_client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show list of clients to add as regular."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    # Get all unique clients from confirmed requests
+    all_clients = store.get_all_unique_clients()
+    # Filter out already regular clients
+    regular_client_ids = {c["user_id"] for c in schedule_manager.get_regular_clients()}
+    available_clients = [c for c in all_clients if c["user_id"] not in regular_client_ids]
+    keyboard = build_add_regular_client_keyboard(available_clients)
+    await query.edit_message_text(
+        "➕ <b>Добавить постоянного клиента</b>\n\n"
+        "Выберите клиента из списка подтвержденных заявок:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def add_client_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add client to regular clients list."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, user_id_str = query.data.split("|", maxsplit=1)
+    user_id = int(user_id_str)
+    # Find client info
+    all_clients = store.get_all_unique_clients()
+    client = next((c for c in all_clients if c["user_id"] == user_id), None)
+    if client:
+        schedule_manager.add_regular_client(
+            user_id=user_id,
+            username=client.get("username", ""),
+            full_name=client.get("full_name", ""),
+        )
+        await query.answer("Клиент добавлен в список постоянных ✅", show_alert=True)
+    else:
+        await query.answer("Клиент не найден", show_alert=True)
+    # Refresh the list
+    clients = schedule_manager.get_regular_clients()
+    keyboard = build_regular_clients_keyboard(clients)
+    await query.edit_message_text(
+        "👥 <b>Постоянные клиенты</b>\n\n"
+        "Список постоянных клиентов. Вы можете удалить клиента или добавить нового из списка подтвержденных клиентов.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def regular_client_slot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show regular client slot management."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, user_id_str = query.data.split("|", maxsplit=1)
+    user_id = int(user_id_str)
+    # Find client info
+    clients = schedule_manager.get_regular_clients()
+    client = next((c for c in clients if c["user_id"] == user_id), None)
+    if not client:
+        await query.answer("Клиент не найден", show_alert=True)
+        return
+    weekday = client.get("weekday")
+    time_str = client.get("time")
+    keyboard = build_regular_client_slot_keyboard(user_id, weekday, time_str)
+    client_name = client.get("full_name", "Unknown")
+    await query.edit_message_text(
+        f"📅 <b>Слот постоянного клиента</b>\n\n"
+        f"Клиент: {client_name}\n\n"
+        f"Назначьте фиксированный день недели и время для этого клиента. "
+        f"Он будет автоматически занимать этот слот каждую неделю.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def regular_client_set_weekday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show weekday selection for regular client slot."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, user_id_str = query.data.split("|", maxsplit=1)
+    user_id = int(user_id_str)
+    keyboard = build_regular_client_weekday_keyboard(user_id)
+    await query.edit_message_text(
+        "📅 <b>Назначить слот постоянному клиенту</b>\n\n"
+        "Выберите день недели:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def regular_client_weekday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show time selection for regular client slot."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, user_id_str, weekday_str = query.data.split("|", maxsplit=2)
+    user_id = int(user_id_str)
+    weekday = int(weekday_str)
+    refresh_daily_slots()
+    keyboard = build_regular_client_time_keyboard(user_id, weekday, daily_slots)
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    await query.edit_message_text(
+        f"📅 <b>Назначить слот постоянному клиенту</b>\n\n"
+        f"День: {weekdays[weekday]}\n"
+        f"Выберите время:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def regular_client_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set slot for regular client."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, user_id_str, weekday_str, time_str = query.data.split("|", maxsplit=3)
+    user_id = int(user_id_str)
+    weekday = int(weekday_str)
+    schedule_manager.set_regular_client_slot(user_id, weekday, time_str)
+    await query.answer("Слот назначен ✅", show_alert=True)
+    # Create bookings for upcoming weeks
+    await create_regular_client_bookings(user_id, weekday, time_str, context)
+    # Refresh the slot view
+    clients = schedule_manager.get_regular_clients()
+    client = next((c for c in clients if c["user_id"] == user_id), None)
+    if client:
+        weekday = client.get("weekday")
+        time_str = client.get("time")
+        keyboard = build_regular_client_slot_keyboard(user_id, weekday, time_str)
+        client_name = client.get("full_name", "Unknown")
+        await query.edit_message_text(
+            f"📅 <b>Слот постоянного клиента</b>\n\n"
+            f"Клиент: {client_name}\n\n"
+            f"Назначьте фиксированный день недели и время для этого клиента. "
+            f"Он будет автоматически занимать этот слот каждую неделю.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+
+async def regular_client_clear_slot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear slot for regular client."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, user_id_str = query.data.split("|", maxsplit=1)
+    user_id = int(user_id_str)
+    schedule_manager.clear_regular_client_slot(user_id)
+    await query.answer("Слот удален ✅", show_alert=True)
+    # Refresh the slot view
+    clients = schedule_manager.get_regular_clients()
+    client = next((c for c in clients if c["user_id"] == user_id), None)
+    if client:
+        weekday = client.get("weekday")
+        time_str = client.get("time")
+        keyboard = build_regular_client_slot_keyboard(user_id, weekday, time_str)
+        client_name = client.get("full_name", "Unknown")
+        await query.edit_message_text(
+            f"📅 <b>Слот постоянного клиента</b>\n\n"
+            f"Клиент: {client_name}\n\n"
+            f"Назначьте фиксированный день недели и время для этого клиента. "
+            f"Он будет автоматически занимать этот слот каждую неделю.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+
+async def create_regular_client_bookings(
+    user_id: int,
+    weekday: int,
+    time_str: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Create confirmed bookings for regular client for upcoming weeks."""
+    clients = schedule_manager.get_regular_clients()
+    client = next((c for c in clients if c["user_id"] == user_id), None)
+    if not client:
+        return
+    
+    today = datetime.now(timezone).date()
+    created_count = 0
+    
+    # Create bookings for the next 4 weeks
+    for week_offset in range(4):
+        # Find the next occurrence of this weekday
+        days_ahead = weekday - today.weekday()
+        if days_ahead < 0:
+            days_ahead += 7
+        elif days_ahead == 0:
+            # Same day - check if time has passed
+            current_time = datetime.now(timezone).time()
+            slot_time = datetime.strptime(time_str, "%H:%M").time()
+            if current_time >= slot_time:
+                days_ahead += 7
+        
+        target_date = today + timedelta(days=days_ahead + (week_offset * 7))
+        
+        # Skip if date is too far in the future
+        if (target_date - today).days > settings.booking_horizon_days:
+            break
+        
+        date_str = target_date.isoformat()
+        
+        # Check if slot is blocked
+        if schedule_manager.is_slot_blocked(date_str, time_str):
+            continue
+        
+        # Check if booking already exists
+        if store.get_slot_state(date_str, time_str):
+            continue
+        
+        # Create confirmed booking
+        try:
+            request = store.create_request(
+                user_id=user_id,
+                username=client.get("username", ""),
+                full_name=client.get("full_name", ""),
+                date_str=date_str,
+                time_str=time_str,
+                is_group_slot=False,
+            )
+            # Auto-confirm for regular clients
+            store.update_status(request.id, "confirmed")
+            created_count += 1
+        except ValueError:
+            # Slot already booked, skip
+            continue
+    
+    if created_count > 0:
+        logger.info(f"Created {created_count} bookings for regular client {user_id} ({weekday}, {time_str})")
+
+
+async def remove_regular_client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove client from regular clients list."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, user_id_str = query.data.split("|", maxsplit=1)
+    user_id = int(user_id_str)
+    schedule_manager.remove_regular_client(user_id)
+    await query.answer("Клиент удален из списка постоянных ✅", show_alert=True)
+    # Refresh the list
+    clients = schedule_manager.get_regular_clients()
+    keyboard = build_regular_clients_keyboard(clients)
+    await query.edit_message_text(
+        "👥 <b>Постоянные клиенты</b>\n\n"
+        "Список постоянных клиентов. Вы можете назначить фиксированный слот (день недели + время) для каждого клиента.\n"
+        "Клиент будет автоматически занимать этот слот каждую неделю.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def group_slots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show group slots management."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    refresh_daily_slots()
+    group_slots = schedule_manager.get_group_slots()
+    keyboard = build_group_slots_keyboard(group_slots, daily_slots)
+    await query.edit_message_text(
+        "👥 <b>Групповые слоты</b>\n\n"
+        "Групповые слоты — это дни недели и время, когда можно записываться нескольким клиентам одновременно.\n"
+        "Такие слоты помечаются эмодзи 👥 в календаре.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def add_group_slot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show weekday selection for new group slot."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    keyboard = build_add_group_slot_weekday_keyboard()
+    await query.edit_message_text(
+        "➕ <b>Добавить групповой слот</b>\n\n"
+        "Выберите день недели:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def group_slot_weekday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show time selection for group slot."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, weekday_str = query.data.split("|", maxsplit=1)
+    weekday = int(weekday_str)
+    refresh_daily_slots()
+    keyboard = build_add_group_slot_time_keyboard(weekday, daily_slots)
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    await query.edit_message_text(
+        f"➕ <b>Добавить групповой слот</b>\n\n"
+        f"День: {weekdays[weekday]}\n"
+        f"Выберите время:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def group_slot_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add group slot."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, weekday_str, time_str = query.data.split("|", maxsplit=2)
+    weekday = int(weekday_str)
+    schedule_manager.add_group_slot(weekday, time_str)
+    await query.answer("Групповой слот добавлен ✅", show_alert=True)
+    # Refresh the list
+    refresh_daily_slots()
+    group_slots = schedule_manager.get_group_slots()
+    keyboard = build_group_slots_keyboard(group_slots, daily_slots)
+    await query.edit_message_text(
+        "👥 <b>Групповые слоты</b>\n\n"
+        "Групповые слоты — это дни недели и время, когда можно записываться нескольким клиентам одновременно.\n"
+        "Такие слоты помечаются эмодзи 👥 в календаре.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def remove_group_slot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove group slot."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, weekday_str, time_str = query.data.split("|", maxsplit=2)
+    weekday = int(weekday_str)
+    schedule_manager.remove_group_slot(weekday, time_str)
+    await query.answer("Групповой слот удален ✅", show_alert=True)
+    # Refresh the list
+    refresh_daily_slots()
+    group_slots = schedule_manager.get_group_slots()
+    keyboard = build_group_slots_keyboard(group_slots, daily_slots)
+    await query.edit_message_text(
+        "👥 <b>Групповые слоты</b>\n\n"
+        "Групповые слоты — это дни недели и время, когда можно записываться нескольким клиентам одновременно.\n"
+        "Такие слоты помечаются эмодзи 👥 в календаре.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def sync_regular_client_bookings(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sync bookings for regular clients - create bookings for upcoming weeks."""
+    regular_slots = schedule_manager.get_all_regular_client_slots()
+    today = datetime.now(timezone).date()
+    
+    for slot_info in regular_slots:
+        user_id = slot_info["user_id"]
+        weekday = slot_info["weekday"]
+        time_str = slot_info["time"]
+        
+        # Find the next occurrence of this weekday
+        days_ahead = weekday - today.weekday()
+        if days_ahead < 0:
+            days_ahead += 7
+        elif days_ahead == 0:
+            # Same day - check if time has passed
+            current_time = datetime.now(timezone).time()
+            slot_time = datetime.strptime(time_str, "%H:%M").time()
+            if current_time >= slot_time:
+                days_ahead += 7
+        
+        # Create bookings for the next 4 weeks
+        for week_offset in range(4):
+            target_date = today + timedelta(days=days_ahead + (week_offset * 7))
+            
+            # Skip if date is too far in the future
+            if (target_date - today).days > settings.booking_horizon_days:
+                break
+            
+            date_str = target_date.isoformat()
+            
+            # Check if slot is blocked
+            if schedule_manager.is_slot_blocked(date_str, time_str):
+                continue
+            
+            # Check if booking already exists
+            if store.get_slot_state(date_str, time_str):
+                continue
+            
+            # Create confirmed booking
+            try:
+                clients = schedule_manager.get_regular_clients()
+                client = next((c for c in clients if c["user_id"] == user_id), None)
+                if not client:
+                    continue
+                
+                request = store.create_request(
+                    user_id=user_id,
+                    username=client.get("username", ""),
+                    full_name=client.get("full_name", ""),
+                    date_str=date_str,
+                    time_str=time_str,
+                    is_group_slot=False,
+                )
+                # Auto-confirm for regular clients
+                store.update_status(request.id, "confirmed")
+            except ValueError:
+                # Slot already booked, skip
+                continue
+
+
 async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send reminders 2 hours before confirmed trainings."""
     now = datetime.now(timezone)
@@ -1422,19 +1956,13 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception as e:
                 logger.warning(f"Failed to send reminder to client {request.user_id}: {e}")
             
-            # Send to trainer
+            # Send to trainers
             trainer_message = (
                 f"⏰ Напоминание: через 2 часа индивидуальная тренировка!\n"
                 f"Время: {slot_text}\n"
                 f"Клиент: {request.full_name} (@{request.username or 'нет'})"
             )
-            try:
-                await context.bot.send_message(
-                    chat_id=settings.instructor_chat_id,
-                    text=trainer_message,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send reminder to trainer: {e}")
+            await send_to_all_instructors(context, trainer_message)
             
             # Mark as sent
             store.mark_reminder_sent(request.id)
@@ -1486,6 +2014,22 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(work_end_callback, pattern=r"^WORK_END\|"))
     application.add_handler(CallbackQueryHandler(work_hours_apply_callback, pattern=r"^WORK_HOURS_APPLY$"))
     application.add_handler(CallbackQueryHandler(work_settings_reset_callback, pattern=r"^WORK_SETTINGS_RESET$"))
+    # Regular clients handlers
+    application.add_handler(CallbackQueryHandler(regular_clients_callback, pattern=r"^REGULAR_CLIENTS$"))
+    application.add_handler(CallbackQueryHandler(add_regular_client_callback, pattern=r"^ADD_REGULAR_CLIENT$"))
+    application.add_handler(CallbackQueryHandler(add_client_confirm_callback, pattern=r"^ADD_CLIENT\|"))
+    application.add_handler(CallbackQueryHandler(regular_client_slot_callback, pattern=r"^REGULAR_CLIENT_SLOT\|"))
+    application.add_handler(CallbackQueryHandler(regular_client_set_weekday_callback, pattern=r"^REGULAR_CLIENT_SET_WEEKDAY\|"))
+    application.add_handler(CallbackQueryHandler(regular_client_weekday_callback, pattern=r"^REGULAR_CLIENT_WEEKDAY\|"))
+    application.add_handler(CallbackQueryHandler(regular_client_time_callback, pattern=r"^REGULAR_CLIENT_TIME\|"))
+    application.add_handler(CallbackQueryHandler(regular_client_clear_slot_callback, pattern=r"^REGULAR_CLIENT_CLEAR_SLOT\|"))
+    application.add_handler(CallbackQueryHandler(remove_regular_client_callback, pattern=r"^REMOVE_CLIENT\|"))
+    # Group slots handlers
+    application.add_handler(CallbackQueryHandler(group_slots_callback, pattern=r"^GROUP_SLOTS$"))
+    application.add_handler(CallbackQueryHandler(add_group_slot_callback, pattern=r"^ADD_GROUP_SLOT$"))
+    application.add_handler(CallbackQueryHandler(group_slot_weekday_callback, pattern=r"^GROUP_SLOT_WEEKDAY\|"))
+    application.add_handler(CallbackQueryHandler(group_slot_time_callback, pattern=r"^GROUP_SLOT_TIME\|"))
+    application.add_handler(CallbackQueryHandler(remove_group_slot_callback, pattern=r"^REMOVE_GROUP_SLOT\|"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
@@ -1504,10 +2048,27 @@ def main() -> None:
             first=10,  # Start after 10 seconds
         )
         logger.info("Reminder job scheduled (runs every 5 minutes)")
+        
+        # Schedule regular client bookings sync to run daily
+        job_queue.run_daily(
+            sync_regular_client_bookings,
+            time=time(hour=0, minute=0),  # Run at midnight
+        )
+        logger.info("Regular client bookings sync scheduled (runs daily at midnight)")
 
     application.run_polling(drop_pending_updates=True)
 
 
+def ensure_event_loop() -> None:
+    """Create and set an event loop when Python 3.11+ doesn't do it automatically."""
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+
 if __name__ == "__main__":
+    ensure_event_loop()
     main()
 

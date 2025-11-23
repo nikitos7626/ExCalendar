@@ -10,7 +10,26 @@
       5,
       6
     ],
-    "work_start_hour": 12,
-    "work_end_hour": 18
-  }
+    "work_start_hour": 8,
+    "work_end_hour": 20
+  },
+  "regular_clients": [
+    {
+      "user_id": 8328977478,
+      "username": "SecondNikitos",
+      "full_name": "Никита",
+      "weekday": null,
+      "time": null
+    }
+  ],
+  "group_slots": [
+    {
+      "weekday": 4,
+      "time": "18:00"
+    },
+    {
+      "weekday": 4,
+      "time": "16:00"
+    }
+  ]
 }

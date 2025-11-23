@@ -31,7 +31,7 @@ WEEKDAY_ALIASES = {
 @dataclass(slots=True, frozen=True)
 class Settings:
     bot_token: str
-    instructor_chat_id: int
+    instructor_chat_ids: List[int]  # List of admin/instructor chat IDs
     timezone: str
     workdays: List[int]
     work_start_hour: int
@@ -69,11 +69,24 @@ def load_settings(env_file: str | None = None) -> Settings:
         load_dotenv(".env", override=True)
 
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    instructor_chat_id = os.getenv("INSTRUCTOR_CHAT_ID")
+    instructor_chat_id_raw = os.getenv("INSTRUCTOR_CHAT_ID")
     if not bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-    if not instructor_chat_id:
+    if not instructor_chat_id_raw:
         raise RuntimeError("INSTRUCTOR_CHAT_ID is not set")
+    
+    # Parse multiple IDs (comma-separated)
+    instructor_chat_ids = []
+    for id_str in instructor_chat_id_raw.split(","):
+        id_str = id_str.strip()
+        if id_str:
+            try:
+                instructor_chat_ids.append(int(id_str))
+            except ValueError:
+                raise ValueError(f"Invalid INSTRUCTOR_CHAT_ID: {id_str} is not a valid integer")
+    
+    if not instructor_chat_ids:
+        raise RuntimeError("INSTRUCTOR_CHAT_ID must contain at least one valid ID")
 
     timezone = os.getenv("TIMEZONE", "Europe/Moscow")
     workdays = _parse_workdays(os.getenv("WORKING_DAYS"))
@@ -92,7 +105,7 @@ def load_settings(env_file: str | None = None) -> Settings:
 
     return Settings(
         bot_token=bot_token,
-        instructor_chat_id=int(instructor_chat_id),
+        instructor_chat_ids=instructor_chat_ids,
         timezone=timezone,
         workdays=workdays,
         work_start_hour=work_start_hour,

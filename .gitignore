@@ -1,6 +1,8 @@
 __pycache__/
 .venv/
 .env
+config.env
 *.pyc
 data/bookings.json
+data/schedule_blocks.json
 

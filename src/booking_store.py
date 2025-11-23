@@ -64,9 +64,12 @@ class BookingStore:
         full_name: str,
         date_str: str,
         time_str: str,
+        is_group_slot: bool = False,
     ) -> BookingRequest:
         with self._lock:
-            if self.get_slot_state(date_str, time_str):
+            # For group slots, allow multiple bookings
+            # For regular slots, check if already booked
+            if not is_group_slot and self.get_slot_state(date_str, time_str):
                 raise ValueError("Slot already requested or confirmed")
             request = BookingRequest(
                 id=str(uuid.uuid4()),
@@ -173,4 +176,26 @@ class BookingStore:
             ]
             if len(self._data["requests"]) != before:
                 self._flush()
+
+    def get_slot_bookings_count(self, date_str: str, time_str: str) -> int:
+        """Get count of confirmed/pending bookings for a slot."""
+        count = 0
+        for request in self._filter_slot(date_str, time_str):
+            if request["status"] in {"pending", "confirmed"}:
+                count += 1
+        return count
+
+    def get_all_unique_clients(self) -> List[Dict]:
+        """Get all unique clients (user_id, username, full_name) from confirmed requests."""
+        clients_map: Dict[int, Dict] = {}
+        for item in self._data["requests"]:
+            if item["status"] == "confirmed":
+                user_id = item["user_id"]
+                if user_id not in clients_map:
+                    clients_map[user_id] = {
+                        "user_id": user_id,
+                        "username": item.get("username", ""),
+                        "full_name": item.get("full_name", ""),
+                    }
+        return list(clients_map.values())
 

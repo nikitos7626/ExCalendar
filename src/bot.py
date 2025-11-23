@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Dict, Iterable, List, Tuple
 
 import pytz
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -29,6 +29,8 @@ from .keyboards import (
     build_add_regular_client_keyboard,
     build_cancel_reason_keyboard,
     build_cancel_select_keyboard,
+    build_confirm_add_trainer_by_id_keyboard,
+    build_confirm_add_trainer_keyboard,
     build_dates_keyboard,
     build_decline_reason_keyboard,
     build_group_slots_keyboard,
@@ -43,6 +45,7 @@ from .keyboards import (
     build_schedule_manage_keyboard,
     build_schedule_weeks_keyboard,
     build_times_keyboard,
+    build_trainers_keyboard,
     build_work_days_keyboard,
     build_work_hours_keyboard,
     build_work_settings_keyboard,
@@ -70,12 +73,25 @@ BUTTON_BOOK = "📅 Записаться"
 BUTTON_MY = "🗓 Мои записи"
 BUTTON_TRAINER = "📘 Записи тренера"
 BUTTON_SCHEDULE = "⚙️ Управление расписанием"
-MENU_BUTTONS = {BUTTON_BOOK, BUTTON_MY, BUTTON_TRAINER, BUTTON_SCHEDULE}
+BUTTON_STATS = "📊 Статистика"
+MENU_BUTTONS = {BUTTON_BOOK, BUTTON_MY, BUTTON_TRAINER, BUTTON_SCHEDULE, BUTTON_STATS}
 DATES_PAGE_SIZE = 6
 
 
 def is_instructor(user_id: int) -> bool:
-    return user_id in settings.instructor_chat_ids
+    """Check if user is an instructor (from config or dynamically added)."""
+    if user_id in settings.instructor_chat_ids:
+        return True
+    # Check dynamically added trainers
+    dynamic_trainer_ids = schedule_manager.get_all_trainer_ids()
+    return user_id in dynamic_trainer_ids
+
+
+def is_main_admin(user_id: int) -> bool:
+    """Check if user is the main administrator (first ID from config.env)."""
+    if not settings.instructor_chat_ids:
+        return False
+    return user_id == settings.instructor_chat_ids[0]
 
 
 async def send_to_all_instructors(
@@ -84,8 +100,13 @@ async def send_to_all_instructors(
     parse_mode: str | None = None,
     reply_markup=None,
 ) -> None:
-    """Send message to all instructors/admins."""
-    for chat_id in settings.instructor_chat_ids:
+    """Send message to all instructors/admins (from config + dynamically added)."""
+    all_instructor_ids = set(settings.instructor_chat_ids)
+    # Add dynamically added trainers
+    dynamic_trainer_ids = schedule_manager.get_all_trainer_ids()
+    all_instructor_ids.update(dynamic_trainer_ids)
+    
+    for chat_id in all_instructor_ids:
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -99,7 +120,10 @@ async def send_to_all_instructors(
 
 def build_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     if is_instructor(user_id):
-        rows = [[BUTTON_TRAINER], [BUTTON_SCHEDULE]]
+        if is_main_admin(user_id):
+            rows = [[BUTTON_TRAINER], [BUTTON_SCHEDULE], [BUTTON_STATS]]
+        else:
+            rows = [[BUTTON_TRAINER], [BUTTON_SCHEDULE]]
     else:
         rows = [[BUTTON_BOOK, BUTTON_MY]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -251,6 +275,8 @@ def cleanup_expired_requests() -> None:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    # Track user activity
+    schedule_manager.track_user_activity(user.id)
     await update.message.reply_text(
         "Привет! Я помогу записаться на индивидуальную тренировку.\n"
         "Нажми «📅 Записаться», чтобы выбрать дату и время (1 час).\n"
@@ -260,6 +286,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    # Track user activity
+    schedule_manager.track_user_activity(user.id)
     await update.message.reply_text(
         "Алгоритм записи:\n"
         "1. Кнопка «📅 Записаться» — выбираешь день и свободный час.\n"
@@ -271,8 +300,94 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show bot statistics (admin only)."""
+    user = update.effective_user
+    if not is_main_admin(user.id):
+        await update.message.reply_text(
+            "Эта команда доступна только главному администратору.",
+            reply_markup=build_main_keyboard(user.id),
+        )
+        return
+    await show_stats_command(update, context)
+
+
+async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display statistics report."""
+    user = update.effective_user
+    if not is_main_admin(user.id):
+        if update.message:
+            await update.message.reply_text(
+                "Эта функция доступна только главному администратору.",
+                reply_markup=build_main_keyboard(user.id),
+            )
+        return
+    
+    # Get user statistics
+    user_stats = schedule_manager.get_user_stats_summary()
+    
+    # Get booking statistics
+    all_requests = store.list_all_requests()
+    total_bookings = len(all_requests)
+    confirmed_bookings = len([r for r in all_requests if r.status == "confirmed"])
+    pending_bookings = len([r for r in all_requests if r.status == "pending"])
+    cancelled_bookings = len([r for r in all_requests if "cancelled" in r.status])
+    declined_bookings = len([r for r in all_requests if r.status == "declined"])
+    
+    # Get unique clients count
+    unique_clients = len(set(r.user_id for r in all_requests))
+    
+    # Get upcoming confirmed bookings
+    now = datetime.now(timezone)
+    upcoming_confirmed = [
+        r for r in all_requests
+        if r.status == "confirmed"
+        and timezone.localize(datetime.strptime(f"{r.date} {r.time}", "%Y-%m-%d %H:%M")) > now
+    ]
+    
+    # Get trainers count
+    total_trainers = len(settings.instructor_chat_ids) + len(schedule_manager.get_trainers())
+    
+    # Build statistics message
+    stats_text = (
+        "<b>📊 Статистика бота</b>\n\n"
+        f"<b>👥 Пользователи:</b>\n"
+        f"Всего пользователей: {user_stats['total_users']}\n"
+        f"Активных сегодня: {user_stats['active_today']}\n"
+        f"Активных за неделю: {user_stats['active_week']}\n"
+        f"Активных за месяц: {user_stats['active_month']}\n\n"
+        f"<b>📅 Заявки:</b>\n"
+        f"Всего заявок: {total_bookings}\n"
+        f"Подтверждено: {confirmed_bookings}\n"
+        f"Ожидают подтверждения: {pending_bookings}\n"
+        f"Отменено: {cancelled_bookings}\n"
+        f"Отклонено: {declined_bookings}\n\n"
+        f"<b>📋 Дополнительно:</b>\n"
+        f"Уникальных клиентов: {unique_clients}\n"
+        f"Предстоящих тренировок: {len(upcoming_confirmed)}\n"
+        f"Всего тренеров: {total_trainers}\n"
+    )
+    
+    if update.message:
+        await update.message.reply_text(
+            stats_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_main_keyboard(user.id),
+        )
+    elif update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(
+            stats_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_main_keyboard(user.id),
+        )
+
+
 async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    # Track user activity
+    schedule_manager.track_user_activity(user.id)
     if is_instructor(user.id):
         await update.message.reply_text(
             "Тренеру недоступна запись. Используйте кнопку «📘 Записи тренера».",
@@ -295,6 +410,8 @@ async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    # Track user activity
+    schedule_manager.track_user_activity(user.id)
     if is_instructor(user.id):
         await update.message.reply_text(
             "Эта функция доступна только клиентам. Используйте «📘 Записи тренера».",
@@ -431,6 +548,8 @@ async def back_to_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    # Track user activity
+    schedule_manager.track_user_activity(query.from_user.id)
     _, date_str, time_str = query.data.split("|", maxsplit=2)
 
     slot_dt = timezone.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
@@ -487,15 +606,19 @@ async def time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if is_group_slot:
         admin_text += f"\nЗаписей на этот слот: {bookings_count}"
     # Send to first instructor with keyboard, others without
-    if settings.instructor_chat_ids:
+    all_instructor_ids = list(settings.instructor_chat_ids) + schedule_manager.get_all_trainer_ids()
+    if all_instructor_ids:
+        first_admin_id = all_instructor_ids[0]
+        is_first_main_admin = is_main_admin(first_admin_id)
+        is_client_already_trainer = is_instructor(user.id)
         await context.bot.send_message(
-            chat_id=settings.instructor_chat_ids[0],
+            chat_id=first_admin_id,
             text=admin_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=build_request_review_keyboard(request.id),
+            reply_markup=build_request_review_keyboard(request.id, user.id, is_first_main_admin, is_client_already_trainer),
         )
         # Send to other instructors without keyboard
-        for chat_id in settings.instructor_chat_ids[1:]:
+        for chat_id in all_instructor_ids[1:]:
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -663,6 +786,78 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user = update.effective_user
 
     if is_instructor(user.id):
+        # Handle trainer ID input (only for main admin)
+        if context.user_data.get("awaiting_trainer_id"):
+            if not is_main_admin(user.id):
+                await message.reply_text(
+                    "Только главный администратор может добавлять тренеров.",
+                    reply_markup=build_main_keyboard(user.id),
+                )
+                context.user_data.pop("awaiting_trainer_id", None)
+                return
+            if text in MENU_BUTTONS:
+                context.user_data.pop("awaiting_trainer_id", None)
+            else:
+                try:
+                    trainer_id = int(text.strip())
+                    # Check if already exists in config
+                    if trainer_id in settings.instructor_chat_ids:
+                        await message.reply_text(
+                            "Этот тренер уже есть в основном списке (config.env).",
+                            reply_markup=build_main_keyboard(user.id),
+                        )
+                        context.user_data.pop("awaiting_trainer_id", None)
+                        return
+                    # Check if already added dynamically
+                    existing_trainers = schedule_manager.get_trainers()
+                    if any(t["user_id"] == trainer_id for t in existing_trainers):
+                        await message.reply_text(
+                            "Этот тренер уже добавлен.",
+                            reply_markup=build_main_keyboard(user.id),
+                        )
+                        context.user_data.pop("awaiting_trainer_id", None)
+                        return
+                    # Try to get user info from bot
+                    try:
+                        trainer_user = await context.bot.get_chat(trainer_id)
+                        trainer_username = trainer_user.username or ""
+                        trainer_full_name = trainer_user.full_name or f"User {trainer_id}"
+                    except Exception:
+                        # If can't get info, use defaults
+                        trainer_username = ""
+                        trainer_full_name = f"User {trainer_id}"
+                    
+                    # Store trainer info for confirmation
+                    context.user_data["pending_trainer"] = {
+                        "user_id": trainer_id,
+                        "username": trainer_username,
+                        "full_name": trainer_full_name,
+                    }
+                    context.user_data.pop("awaiting_trainer_id", None)
+                    
+                    # Show confirmation
+                    confirm_text = (
+                        "<b>⚠️ Подтверждение добавления тренера</b>\n\n"
+                        f"Вы действительно хотите добавить этого пользователя как тренера?\n\n"
+                        f"<b>Информация:</b>\n"
+                        f"Имя: {trainer_full_name}\n"
+                        f"Username: @{trainer_username or 'нет'}\n"
+                        f"ID: {trainer_id}\n\n"
+                        f"Тренер получит доступ ко всем функциям управления расписанием и заявками."
+                    )
+                    await message.reply_text(
+                        confirm_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=build_confirm_add_trainer_by_id_keyboard(trainer_id),
+                    )
+                    return
+                except ValueError:
+                    await message.reply_text(
+                        "Неверный формат. Отправьте числовой chat_id тренера.",
+                        reply_markup=build_main_keyboard(user.id),
+                    )
+                    return
+        
         pending_decline = context.chat_data.get("awaiting_reason")
         if pending_decline:
             if text in MENU_BUTTONS:
@@ -710,6 +905,9 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     if is_instructor(user.id) and text == BUTTON_SCHEDULE:
         await schedule_manage_command(update, context)
+        return
+    if is_main_admin(user.id) and text == BUTTON_STATS:
+        await show_stats_command(update, context)
         return
 
     await message.reply_text(
@@ -951,7 +1149,7 @@ async def schedule_manage_command(update: Update, context: ContextTypes.DEFAULT_
         "⚙️ <b>Управление расписанием</b>\n\n"
         "Выберите, что хотите настроить:",
         parse_mode=ParseMode.HTML,
-        reply_markup=build_schedule_manage_keyboard(),
+        reply_markup=build_schedule_manage_keyboard(user.id, is_main_admin(user.id)),
     )
 
 
@@ -966,7 +1164,7 @@ async def schedule_menu_callback(update: Update, context: ContextTypes.DEFAULT_T
         "⚙️ <b>Управление расписанием</b>\n\n"
         "Выберите, что хотите настроить:",
         parse_mode=ParseMode.HTML,
-        reply_markup=build_schedule_manage_keyboard(),
+        reply_markup=build_schedule_manage_keyboard(query.from_user.id, is_main_admin(query.from_user.id)),
     )
 
 
@@ -1864,6 +2062,245 @@ async def remove_group_slot_callback(update: Update, context: ContextTypes.DEFAU
     )
 
 
+async def manage_trainers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show trainers management."""
+    query = update.callback_query
+    if not is_main_admin(query.from_user.id):
+        await query.answer("Только главный администратор может управлять тренерами", show_alert=True)
+        return
+    await query.answer()
+    trainers = schedule_manager.get_trainers()
+    keyboard = build_trainers_keyboard(trainers)
+    await query.edit_message_text(
+        "👤 <b>Управление тренерами</b>\n\n"
+        "Список динамически добавленных тренеров. Вы можете добавить нового тренера по его chat_id или удалить существующего.\n\n"
+        "Чтобы добавить тренера, нажмите кнопку ниже и отправьте его chat_id (число).",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def add_trainer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start adding trainer flow."""
+    query = update.callback_query
+    if not is_main_admin(query.from_user.id):
+        await query.answer("Только главный администратор может добавлять тренеров", show_alert=True)
+        return
+    await query.answer()
+    context.user_data["awaiting_trainer_id"] = True
+    await query.edit_message_text(
+        "➕ <b>Добавить тренера</b>\n\n"
+        "Отправьте chat_id тренера (число).\n"
+        "Чтобы узнать chat_id, попросите тренера написать боту @userinfobot или используйте его Telegram ID.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩️ Отмена", callback_data="MANAGE_TRAINERS")]
+        ]),
+    )
+
+
+async def remove_trainer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove trainer."""
+    query = update.callback_query
+    if not is_main_admin(query.from_user.id):
+        await query.answer("Только главный администратор может удалять тренеров", show_alert=True)
+        return
+    await query.answer()
+    _, user_id_str = query.data.split("|", maxsplit=1)
+    user_id = int(user_id_str)
+    
+    # Don't allow removing trainers from config
+    if user_id in settings.instructor_chat_ids:
+        await query.answer("Нельзя удалить тренера из основного списка (config.env)", show_alert=True)
+        return
+    
+    schedule_manager.remove_trainer(user_id)
+    await query.answer("Тренер удален ✅", show_alert=True)
+    # Refresh the list
+    trainers = schedule_manager.get_trainers()
+    keyboard = build_trainers_keyboard(trainers)
+    await query.edit_message_text(
+        "👤 <b>Управление тренерами</b>\n\n"
+        "Список динамически добавленных тренеров. Вы можете добавить нового тренера по его chat_id или удалить существующего.\n\n"
+        "Чтобы добавить тренера, нажмите кнопку ниже и отправьте его chat_id (число).",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def add_trainer_from_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show confirmation for adding trainer from request card."""
+    query = update.callback_query
+    if not is_main_admin(query.from_user.id):
+        await query.answer("Только главный администратор может добавлять тренеров", show_alert=True)
+        return
+    await query.answer()
+    _, request_id, user_id_str = query.data.split("|", maxsplit=2)
+    user_id = int(user_id_str)
+    
+    try:
+        request = store.get_request(request_id)
+    except KeyError:
+        await query.answer("Заявка не найдена", show_alert=True)
+        return
+    
+    # Check if already exists in config
+    if user_id in settings.instructor_chat_ids:
+        await query.answer("Этот тренер уже есть в основном списке (config.env)", show_alert=True)
+        return
+    
+    # Check if already added dynamically
+    existing_trainers = schedule_manager.get_trainers()
+    if any(t["user_id"] == user_id for t in existing_trainers):
+        await query.answer("Этот тренер уже добавлен", show_alert=True)
+        return
+    
+    # Show confirmation
+    confirm_text = (
+        "<b>⚠️ Подтверждение добавления тренера</b>\n\n"
+        f"Вы действительно хотите добавить этого пользователя как тренера?\n\n"
+        f"<b>Информация:</b>\n"
+        f"Имя: {request.full_name}\n"
+        f"Username: @{request.username or 'нет'}\n"
+        f"ID: {user_id}\n\n"
+        f"Тренер получит доступ ко всем функциям управления расписанием и заявками."
+    )
+    await query.edit_message_text(
+        confirm_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_confirm_add_trainer_keyboard(request_id, user_id),
+    )
+
+
+async def confirm_add_trainer_from_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm and add trainer from request card."""
+    query = update.callback_query
+    if not is_main_admin(query.from_user.id):
+        await query.answer("Только главный администратор может добавлять тренеров", show_alert=True)
+        return
+    await query.answer()
+    _, request_id, user_id_str = query.data.split("|", maxsplit=2)
+    user_id = int(user_id_str)
+    
+    try:
+        request = store.get_request(request_id)
+    except KeyError:
+        await query.answer("Заявка не найдена", show_alert=True)
+        return
+    
+    # Double-check if already exists
+    if user_id in settings.instructor_chat_ids:
+        await query.answer("Этот тренер уже есть в основном списке (config.env)", show_alert=True)
+        return
+    
+    existing_trainers = schedule_manager.get_trainers()
+    if any(t["user_id"] == user_id for t in existing_trainers):
+        await query.answer("Этот тренер уже добавлен", show_alert=True)
+        return
+    
+    # Add trainer using info from request
+    schedule_manager.add_trainer(
+        user_id=user_id,
+        username=request.username,
+        full_name=request.full_name,
+    )
+    await query.answer("Тренер добавлен ✅", show_alert=True)
+    
+    # Update the message to show updated keyboard (client is now a trainer, so button won't show)
+    admin_text = (
+        "<b>Новая заявка</b>\n"
+        f"Дата: {humanize_slot(request.date, request.time)}\n"
+        f"Клиент: {request.full_name} "
+        f"(@{request.username or 'нет'} | id {request.user_id})\n\n"
+        f"✅ <b>Добавлен как тренер</b>"
+    )
+    await query.edit_message_text(
+        admin_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_request_review_keyboard(request_id, user_id, True, is_client_trainer=True),
+    )
+
+
+async def cancel_add_trainer_from_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel adding trainer from request - return to request card."""
+    query = update.callback_query
+    if not is_main_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, request_id = query.data.split("|", maxsplit=1)
+    
+    try:
+        request = store.get_request(request_id)
+    except KeyError:
+        await query.answer("Заявка не найдена", show_alert=True)
+        return
+    
+    # Return to request card
+    admin_text = (
+        "<b>Новая заявка</b>\n"
+        f"Дата: {humanize_slot(request.date, request.time)}\n"
+        f"Клиент: {request.full_name} "
+        f"(@{request.username or 'нет'} | id {request.user_id})"
+    )
+    is_client_already_trainer = is_instructor(request.user_id)
+    await query.edit_message_text(
+        admin_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_request_review_keyboard(request_id, request.user_id, True, is_client_already_trainer),
+    )
+
+
+async def confirm_add_trainer_by_id_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm and add trainer by ID."""
+    query = update.callback_query
+    if not is_main_admin(query.from_user.id):
+        await query.answer("Только главный администратор может добавлять тренеров", show_alert=True)
+        return
+    await query.answer()
+    _, user_id_str = query.data.split("|", maxsplit=1)
+    user_id = int(user_id_str)
+    
+    # Get trainer info from context
+    pending_trainer = context.user_data.get("pending_trainer")
+    if not pending_trainer or pending_trainer["user_id"] != user_id:
+        await query.answer("Ошибка: данные тренера не найдены", show_alert=True)
+        return
+    
+    # Double-check if already exists
+    if user_id in settings.instructor_chat_ids:
+        await query.answer("Этот тренер уже есть в основном списке (config.env)", show_alert=True)
+        context.user_data.pop("pending_trainer", None)
+        return
+    
+    existing_trainers = schedule_manager.get_trainers()
+    if any(t["user_id"] == user_id for t in existing_trainers):
+        await query.answer("Этот тренер уже добавлен", show_alert=True)
+        context.user_data.pop("pending_trainer", None)
+        return
+    
+    # Add trainer
+    schedule_manager.add_trainer(
+        user_id=pending_trainer["user_id"],
+        username=pending_trainer["username"],
+        full_name=pending_trainer["full_name"],
+    )
+    await query.answer("Тренер добавлен ✅", show_alert=True)
+    context.user_data.pop("pending_trainer", None)
+    
+    # Update message
+    await query.edit_message_text(
+        f"✅ <b>Тренер добавлен</b>\n\n"
+        f"ID: {user_id}\n"
+        f"Имя: {pending_trainer['full_name']}\n"
+        f"Username: @{pending_trainer['username'] or 'нет'}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩️ К управлению тренерами", callback_data="MANAGE_TRAINERS")]
+        ]),
+    )
+
+
 async def sync_regular_client_bookings(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sync bookings for regular clients - create bookings for upcoming weeks."""
     regular_slots = schedule_manager.get_all_regular_client_slots()
@@ -1979,6 +2416,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("book", start_booking))
     application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("stats", stats_command))
 
     application.add_handler(CallbackQueryHandler(date_callback, pattern=r"^DATE\|"))
     application.add_handler(CallbackQueryHandler(time_callback, pattern=r"^TIME\|"))
@@ -2030,6 +2468,14 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(group_slot_weekday_callback, pattern=r"^GROUP_SLOT_WEEKDAY\|"))
     application.add_handler(CallbackQueryHandler(group_slot_time_callback, pattern=r"^GROUP_SLOT_TIME\|"))
     application.add_handler(CallbackQueryHandler(remove_group_slot_callback, pattern=r"^REMOVE_GROUP_SLOT\|"))
+    # Trainers management handlers
+    application.add_handler(CallbackQueryHandler(manage_trainers_callback, pattern=r"^MANAGE_TRAINERS$"))
+    application.add_handler(CallbackQueryHandler(add_trainer_callback, pattern=r"^ADD_TRAINER$"))
+    application.add_handler(CallbackQueryHandler(remove_trainer_callback, pattern=r"^REMOVE_TRAINER\|"))
+    application.add_handler(CallbackQueryHandler(add_trainer_from_request_callback, pattern=r"^ADD_TR_REQ\|"))
+    application.add_handler(CallbackQueryHandler(confirm_add_trainer_from_request_callback, pattern=r"^CFM_TR_REQ\|"))
+    application.add_handler(CallbackQueryHandler(cancel_add_trainer_from_request_callback, pattern=r"^CNL_TR_REQ\|"))
+    application.add_handler(CallbackQueryHandler(confirm_add_trainer_by_id_callback, pattern=r"^CFM_TR_ID\|"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE

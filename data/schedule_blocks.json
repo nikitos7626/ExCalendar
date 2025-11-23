@@ -31,5 +31,21 @@
       "weekday": 4,
       "time": "16:00"
     }
-  ]
+  ],
+  "trainers": [
+    {
+      "user_id": 8328977478,
+      "username": "SecondNikitos",
+      "full_name": "Никита"
+    }
+  ],
+  "user_stats": {
+    "8328977478": {
+      "first_seen": "2025-11-23",
+      "last_seen": "2025-11-23",
+      "activity_days": [
+        "2025-11-23"
+      ]
+    }
+  }
 }

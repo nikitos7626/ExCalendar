@@ -19,6 +19,8 @@ class ScheduleManager:
             "work_settings": None,  # {"workdays": [0,1,2,3,4], "work_start_hour": 8, "work_end_hour": 22}
             "regular_clients": [],  # [{"user_id": int, "username": str, "full_name": str}, ...]
             "group_slots": [],  # [{"weekday": int, "time": "HH:MM"}, ...] - слоты где можно записываться >1 человеку
+            "trainers": [],  # [{"user_id": int, "username": str, "full_name": str}, ...] - динамически добавленные тренеры
+            "user_stats": {},  # {"user_id": {"first_seen": "YYYY-MM-DD", "last_seen": "YYYY-MM-DD", "activity_days": ["YYYY-MM-DD", ...]}}
         }
         self._load()
 
@@ -39,6 +41,8 @@ class ScheduleManager:
                     "work_settings": loaded.get("work_settings"),
                     "regular_clients": regular_clients,
                     "group_slots": loaded.get("group_slots", []),
+                    "trainers": loaded.get("trainers", []),
+                    "user_stats": loaded.get("user_stats", {}),
                 }
         else:
             self._flush()
@@ -286,4 +290,101 @@ class ScheduleManager:
         except (ValueError, KeyError):
             pass
         return False
+
+    def get_trainers(self) -> List[Dict]:
+        """Get list of dynamically added trainers."""
+        return self._data.get("trainers", []).copy()
+
+    def add_trainer(self, user_id: int, username: str, full_name: str) -> None:
+        """Add a trainer to the trainers list."""
+        with self._lock:
+            if "trainers" not in self._data:
+                self._data["trainers"] = []
+            # Check if already exists
+            if not any(t["user_id"] == user_id for t in self._data["trainers"]):
+                self._data["trainers"].append({
+                    "user_id": user_id,
+                    "username": username or "",
+                    "full_name": full_name,
+                })
+                self._flush()
+
+    def remove_trainer(self, user_id: int) -> None:
+        """Remove a trainer from the trainers list."""
+        with self._lock:
+            if "trainers" not in self._data:
+                return
+            self._data["trainers"] = [
+                t for t in self._data["trainers"] if t["user_id"] != user_id
+            ]
+            self._flush()
+
+    def get_all_trainer_ids(self) -> List[int]:
+        """Get all trainer IDs (from config + dynamically added)."""
+        return [t["user_id"] for t in self._data.get("trainers", [])]
+
+    def track_user_activity(self, user_id: int) -> None:
+        """Track user activity - record when user interacts with bot."""
+        with self._lock:
+            if "user_stats" not in self._data:
+                self._data["user_stats"] = {}
+            
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            
+            if str(user_id) not in self._data["user_stats"]:
+                # New user
+                self._data["user_stats"][str(user_id)] = {
+                    "first_seen": today_str,
+                    "last_seen": today_str,
+                    "activity_days": [today_str],
+                }
+            else:
+                # Existing user - update last_seen and add today if not present
+                user_stat = self._data["user_stats"][str(user_id)]
+                user_stat["last_seen"] = today_str
+                if today_str not in user_stat["activity_days"]:
+                    user_stat["activity_days"].append(today_str)
+                    user_stat["activity_days"].sort()
+            
+            self._flush()
+
+    def get_user_stats_summary(self) -> Dict:
+        """Get summary statistics about users."""
+        user_stats = self._data.get("user_stats", {})
+        if not user_stats:
+            return {
+                "total_users": 0,
+                "active_today": 0,
+                "active_week": 0,
+                "active_month": 0,
+            }
+        
+        today = datetime.now().date()
+        today_str = today.strftime("%Y-%m-%d")
+        week_ago = today - timedelta(days=7)
+        month_ago = today - timedelta(days=30)
+        
+        active_today = 0
+        active_week = 0
+        active_month = 0
+        
+        for user_id_str, stat in user_stats.items():
+            last_seen = datetime.strptime(stat["last_seen"], "%Y-%m-%d").date()
+            activity_days = [datetime.strptime(d, "%Y-%m-%d").date() for d in stat.get("activity_days", [])]
+            
+            if last_seen == today:
+                active_today += 1
+            
+            if last_seen >= week_ago:
+                active_week += 1
+            
+            if last_seen >= month_ago:
+                active_month += 1
+        
+        return {
+            "total_users": len(user_stats),
+            "active_today": active_today,
+            "active_week": active_week,
+            "active_month": active_month,
+        }
 

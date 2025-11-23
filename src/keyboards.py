@@ -84,15 +84,25 @@ def build_times_keyboard(date_str: str, times: Iterable[str], back_page: int, gr
     return InlineKeyboardMarkup(buttons)
 
 
-def build_request_review_keyboard(request_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def build_request_review_keyboard(
+    request_id: str, 
+    client_user_id: int | None = None, 
+    is_main_admin: bool = False,
+    is_client_trainer: bool = False,
+) -> InlineKeyboardMarkup:
+    """Build keyboard for reviewing request. Shows 'Add as trainer' button for main admin if client is not already a trainer."""
+    buttons = [
         [
-            [
-                InlineKeyboardButton("✅ Принять", callback_data=f"REVIEW|{request_id}|approve"),
-                InlineKeyboardButton("❌ Отклонить", callback_data=f"REVIEW|{request_id}|decline"),
-            ]
+            InlineKeyboardButton("✅ Принять", callback_data=f"REVIEW|{request_id}|approve"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"REVIEW|{request_id}|decline"),
         ]
-    )
+    ]
+    # Add "Add as trainer" button for main admin if client_user_id provided and client is not already a trainer
+    if is_main_admin and client_user_id is not None and not is_client_trainer:
+        buttons.append([
+            InlineKeyboardButton("👤 Добавить как тренера", callback_data=f"ADD_TR_REQ|{request_id}|{client_user_id}"),
+        ])
+    return InlineKeyboardMarkup(buttons)
 
 
 def build_pending_requests_keyboard(options: Iterable[Tuple[str, str]]) -> InlineKeyboardMarkup:
@@ -171,17 +181,20 @@ def build_admin_cancel_reason_keyboard(request_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def build_schedule_manage_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📅 Управление днями", callback_data="SCHEDULE_DAYS")],
-            [InlineKeyboardButton("📆 Управление неделями", callback_data="SCHEDULE_WEEKS")],
-            [InlineKeyboardButton("⚙️ Настройка рабочего времени", callback_data="SCHEDULE_WORK_SETTINGS")],
-            [InlineKeyboardButton("👥 Постоянные клиенты", callback_data="REGULAR_CLIENTS")],
-            [InlineKeyboardButton("👥 Групповые слоты", callback_data="GROUP_SLOTS")],
-            [InlineKeyboardButton("↩️ Назад", callback_data="SCHEDULE_BACK")],
-        ]
-    )
+def build_schedule_manage_keyboard(user_id: int | None = None, is_main_admin: bool = False) -> InlineKeyboardMarkup:
+    """Build schedule management keyboard. Shows trainer management only for main admin."""
+    buttons = [
+        [InlineKeyboardButton("📅 Управление днями", callback_data="SCHEDULE_DAYS")],
+        [InlineKeyboardButton("📆 Управление неделями", callback_data="SCHEDULE_WEEKS")],
+        [InlineKeyboardButton("⚙️ Настройка рабочего времени", callback_data="SCHEDULE_WORK_SETTINGS")],
+        [InlineKeyboardButton("👥 Постоянные клиенты", callback_data="REGULAR_CLIENTS")],
+        [InlineKeyboardButton("👥 Групповые слоты", callback_data="GROUP_SLOTS")],
+    ]
+    # Only show trainer management for main admin
+    if is_main_admin:
+        buttons.append([InlineKeyboardButton("👤 Управление тренерами", callback_data="MANAGE_TRAINERS")])
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="SCHEDULE_BACK")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def build_schedule_days_keyboard(
@@ -571,4 +584,42 @@ def build_regular_client_time_keyboard(user_id: int, weekday: int, times: List[s
     weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     buttons.append([InlineKeyboardButton("↩️ Назад", callback_data=f"REGULAR_CLIENT_SET_WEEKDAY|{user_id}")])
     return InlineKeyboardMarkup(buttons)
+
+
+def build_trainers_keyboard(trainers: List[Dict]) -> InlineKeyboardMarkup:
+    """Build keyboard for managing trainers."""
+    buttons: List[List[InlineKeyboardButton]] = []
+    for trainer in trainers:
+        label = f"{trainer.get('full_name', 'Unknown')} (@{trainer.get('username', 'no_username')})"
+        buttons.append([
+            InlineKeyboardButton(
+                f"❌ {label}",
+                callback_data=f"REMOVE_TRAINER|{trainer['user_id']}",
+            )
+        ])
+    if not buttons:
+        buttons = [[InlineKeyboardButton("Нет добавленных тренеров", callback_data="IGNORE")]]
+    buttons.append([InlineKeyboardButton("➕ Добавить тренера", callback_data="ADD_TRAINER")])
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="SCHEDULE_MENU")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_confirm_add_trainer_keyboard(request_id: str, user_id: int) -> InlineKeyboardMarkup:
+    """Build keyboard for confirming trainer addition from request."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, добавить", callback_data=f"CFM_TR_REQ|{request_id}|{user_id}"),
+            InlineKeyboardButton("❌ Отмена", callback_data=f"CNL_TR_REQ|{request_id}"),
+        ]
+    ])
+
+
+def build_confirm_add_trainer_by_id_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Build keyboard for confirming trainer addition by ID."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, добавить", callback_data=f"CFM_TR_ID|{user_id}"),
+            InlineKeyboardButton("❌ Отмена", callback_data="MANAGE_TRAINERS"),
+        ]
+    ])
 

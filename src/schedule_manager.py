@@ -17,6 +17,7 @@ class ScheduleManager:
         self._data: Dict = {
             "blocked_slots": {},  # {"YYYY-MM-DD": ["HH:MM", ...]}
             "work_settings": None,  # {"workdays": [0,1,2,3,4], "work_start_hour": 8, "work_end_hour": 22}
+            "manual_slots": {},  # {"0": ["09:00", ...], ...} - ручное расписание по дням недели
             "regular_clients": [],  # [{"user_id": int, "username": str, "full_name": str}, ...]
             "group_slots": [],  # [{"weekday": int, "time": "HH:MM"}, ...] - слоты где можно записываться >1 человеку
             "trainers": [],  # [{"user_id": int, "username": str, "full_name": str}, ...] - динамически добавленные тренеры
@@ -39,6 +40,7 @@ class ScheduleManager:
                 self._data = {
                     "blocked_slots": loaded.get("blocked_slots", {}),
                     "work_settings": loaded.get("work_settings"),
+                    "manual_slots": loaded.get("manual_slots", {}),
                     "regular_clients": regular_clients,
                     "group_slots": loaded.get("group_slots", []),
                     "trainers": loaded.get("trainers", []),
@@ -171,6 +173,38 @@ class ScheduleManager:
         with self._lock:
             self._data["work_settings"] = None
             self._flush()
+
+    def get_manual_slots(self) -> Dict[str, List[str]]:
+        """Return manual weekly schedule (keys are weekday numbers as strings)."""
+        return self._data.get("manual_slots", {})
+
+    def set_manual_slots_for_weekday(self, weekday: int, slots: List[str]) -> None:
+        """Persist manual slots for a specific weekday (0=Mon)."""
+        weekday_key = str(weekday)
+        # Ensure times are unique and sorted
+        normalized = sorted(set(slots))
+        with self._lock:
+            if "manual_slots" not in self._data:
+                self._data["manual_slots"] = {}
+            if normalized:
+                self._data["manual_slots"][weekday_key] = normalized
+            elif weekday_key in self._data["manual_slots"]:
+                # Remove key if empty to avoid clutter
+                del self._data["manual_slots"][weekday_key]
+            self._flush()
+
+    def clear_manual_slots(self) -> None:
+        """Remove manual weekly schedule."""
+        with self._lock:
+            self._data["manual_slots"] = {}
+            self._flush()
+
+    def has_manual_slots(self) -> bool:
+        """Return True if at least one weekday has manual slots configured."""
+        manual = self._data.get("manual_slots", {})
+        if not manual:
+            return False
+        return any(slots for slots in manual.values())
 
     def get_regular_clients(self) -> List[Dict]:
         """Get list of regular clients."""

@@ -49,6 +49,8 @@ from .keyboards import (
     build_work_days_keyboard,
     build_work_hours_keyboard,
     build_work_settings_keyboard,
+    build_manual_schedule_keyboard,
+    build_manual_day_times_keyboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,7 @@ BUTTON_SCHEDULE = "⚙️ Управление расписанием"
 BUTTON_STATS = "📊 Статистика"
 MENU_BUTTONS = {BUTTON_BOOK, BUTTON_MY, BUTTON_TRAINER, BUTTON_SCHEDULE, BUTTON_STATS}
 DATES_PAGE_SIZE = 6
+MANUAL_TIME_OPTIONS = [f"{hour:02d}:00" for hour in range(0, 24)]
 
 
 def is_instructor(user_id: int) -> bool:
@@ -180,6 +183,50 @@ def get_effective_work_settings() -> Tuple[List[int], int, int]:
     return settings.workdays, settings.work_start_hour, settings.work_end_hour
 
 
+def get_manual_schedule() -> Dict[int, List[str]]:
+    """Return manual weekly schedule normalized with integer weekday keys."""
+    raw = schedule_manager.get_manual_slots()
+    manual: Dict[int, List[str]] = {}
+    for day_key, times in raw.items():
+        try:
+            day_num = int(day_key)
+        except (TypeError, ValueError):
+            continue
+        normalized = sorted(
+            {t for t in times if isinstance(t, str) and len(t) == 5 and ":" in t}
+        )
+        if normalized:
+            manual[day_num] = normalized
+    return manual
+
+
+def has_manual_schedule() -> bool:
+    """Check if trainer configured manual day/time slots."""
+    return bool(get_manual_schedule())
+
+
+def get_active_workdays() -> List[int]:
+    """Return weekdays that should be shown to clients."""
+    manual = get_manual_schedule()
+    if manual:
+        return sorted(manual.keys())
+    workdays, _, _ = get_effective_work_settings()
+    return workdays
+
+
+def get_slots_for_weekday(weekday: int) -> List[str]:
+    """Return list of base slots for given weekday (manual or default)."""
+    manual = get_manual_schedule()
+    if manual:
+        return manual.get(weekday, [])
+    return daily_slots
+
+
+def get_slots_for_date(target_date: date) -> List[str]:
+    """Convenience wrapper for date objects."""
+    return get_slots_for_weekday(target_date.weekday())
+
+
 def _generate_daily_slots() -> List[str]:
     """Generate daily slots based on current work settings."""
     _, work_start, work_end = get_effective_work_settings()
@@ -208,7 +255,7 @@ def collect_available_dates_with_labels() -> Tuple[List[Tuple[date, str]], set[s
     cleanup_expired_requests()
     schedule_manager.cleanup_past_blocks(datetime.now(timezone))
     refresh_daily_slots()  # Refresh in case settings changed
-    workdays, _, _ = get_effective_work_settings()
+    workdays = get_active_workdays()
     today = datetime.now(timezone).date()
     result: List[Tuple[date, str]] = []
     group_dates: set[str] = set()
@@ -217,14 +264,12 @@ def collect_available_dates_with_labels() -> Tuple[List[Tuple[date, str]], set[s
     
     for offset in range(settings.booking_horizon_days):
         candidate = today + timedelta(days=offset)
-        if candidate.weekday() in workdays:
-            # Skip fully blocked days (when all slots are blocked)
+        slots_for_day = get_slots_for_date(candidate)
+        if candidate.weekday() in workdays and slots_for_day:
             date_str = candidate.isoformat()
             blocked_slots = schedule_manager.get_blocked_slots_for_day(date_str)
-            # If day is not fully blocked, include it
-            if len(blocked_slots) < len(daily_slots):
+            if len(blocked_slots) < len(slots_for_day):
                 result.append((candidate, format_day_short(candidate)))
-                # Check if this date has any group slots
                 weekday = candidate.weekday()
                 for slot in group_slots:
                     if slot["weekday"] == weekday:
@@ -507,8 +552,9 @@ async def date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     group_slots = schedule_manager.get_group_slots()
     group_times = {slot["time"] for slot in group_slots if slot["weekday"] == weekday}
     
+    base_slots = get_slots_for_date(dt)
     free_slots = []
-    for slot in daily_slots:
+    for slot in base_slots:
         if slot in blocked_slots:
             continue
         # For group slots, allow multiple bookings
@@ -1180,9 +1226,10 @@ async def schedule_days_callback(update: Update, context: ContextTypes.DEFAULT_T
     # Also include fully blocked days for unblocking
     today = datetime.now(timezone).date()
     blocked_dates = schedule_manager.get_all_blocked_dates()
+    workdays = get_active_workdays()
     for offset in range(settings.booking_horizon_days):
         candidate = today + timedelta(days=offset)
-        if candidate.weekday() in settings.workdays:
+        if candidate.weekday() in workdays:
             date_str = candidate.isoformat()
             if date_str in blocked_dates:
                 # Check if it's already in dates
@@ -1211,9 +1258,10 @@ async def schedule_days_page_callback(update: Update, context: ContextTypes.DEFA
     dates, _ = collect_available_dates_with_labels()
     today = datetime.now(timezone).date()
     blocked_dates = schedule_manager.get_all_blocked_dates()
+    workdays = get_active_workdays()
     for offset in range(settings.booking_horizon_days):
         candidate = today + timedelta(days=offset)
-        if candidate.weekday() in settings.workdays:
+        if candidate.weekday() in workdays:
             date_str = candidate.isoformat()
             if date_str in blocked_dates:
                 if not any(d[0] == candidate for d in dates):
@@ -1237,9 +1285,11 @@ async def schedule_day_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     refresh_daily_slots()  # Refresh in case settings changed
     _, date_str = query.data.split("|", maxsplit=1)
-    day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
+    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    base_slots = get_slots_for_date(target_date)
+    day_label = format_day_full(target_date)
     blocked_times = schedule_manager.get_blocked_slots_for_day(date_str)
-    keyboard = build_schedule_day_times_keyboard(date_str, daily_slots, blocked_times)
+    keyboard = build_schedule_day_times_keyboard(date_str, base_slots, blocked_times)
     await query.edit_message_text(
         f"📅 <b>Управление слотами</b>\n\n"
         f"День: {day_label}\n"
@@ -1266,9 +1316,11 @@ async def schedule_slot_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("Слот открыт ✅", show_alert=True)
     # Refresh the day view
     refresh_daily_slots()  # Refresh in case settings changed
-    day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
+    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    base_slots = get_slots_for_date(target_date)
+    day_label = format_day_full(target_date)
     blocked_times = schedule_manager.get_blocked_slots_for_day(date_str)
-    keyboard = build_schedule_day_times_keyboard(date_str, daily_slots, blocked_times)
+    keyboard = build_schedule_day_times_keyboard(date_str, base_slots, blocked_times)
     await query.edit_message_text(
         f"📅 <b>Управление слотами</b>\n\n"
         f"День: {day_label}\n"
@@ -1287,11 +1339,13 @@ async def schedule_day_block_callback(update: Update, context: ContextTypes.DEFA
         return
     await query.answer()
     _, date_str = query.data.split("|", maxsplit=1)
-    schedule_manager.block_day(date_str, daily_slots)
+    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    base_slots = get_slots_for_date(target_date)
+    schedule_manager.block_day(date_str, base_slots)
     await query.answer("Весь день закрыт ✅", show_alert=True)
-    day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
+    day_label = format_day_full(target_date)
     blocked_times = schedule_manager.get_blocked_slots_for_day(date_str)
-    keyboard = build_schedule_day_times_keyboard(date_str, daily_slots, blocked_times)
+    keyboard = build_schedule_day_times_keyboard(date_str, base_slots, blocked_times)
     await query.edit_message_text(
         f"📅 <b>Управление слотами</b>\n\n"
         f"День: {day_label}\n"
@@ -1312,9 +1366,11 @@ async def schedule_day_unblock_callback(update: Update, context: ContextTypes.DE
     _, date_str = query.data.split("|", maxsplit=1)
     schedule_manager.unblock_day(date_str)
     await query.answer("Весь день открыт ✅", show_alert=True)
-    day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
+    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    base_slots = get_slots_for_date(target_date)
+    day_label = format_day_full(target_date)
     blocked_times = schedule_manager.get_blocked_slots_for_day(date_str)
-    keyboard = build_schedule_day_times_keyboard(date_str, daily_slots, blocked_times)
+    keyboard = build_schedule_day_times_keyboard(date_str, base_slots, blocked_times)
     await query.edit_message_text(
         f"📅 <b>Управление слотами</b>\n\n"
         f"День: {day_label}\n"
@@ -1387,10 +1443,13 @@ async def schedule_week_block_callback(update: Update, context: ContextTypes.DEF
     # Block all days in the week with all time slots
     days_since_monday = week_start.weekday()
     monday = week_start - timedelta(days=days_since_monday)
+    active_workdays = set(get_active_workdays())
     for day_offset in range(7):
         day = monday + timedelta(days=day_offset)
-        if day.weekday() in settings.workdays:
-            schedule_manager.block_day(day.isoformat(), daily_slots)
+        if day.weekday() in active_workdays:
+            slots = get_slots_for_weekday(day.weekday())
+            if slots:
+                schedule_manager.block_day(day.isoformat(), slots)
     await query.answer("Неделя закрыта ✅", show_alert=True)
     # Refresh weeks view
     today = datetime.now(timezone).date()
@@ -1446,15 +1505,28 @@ async def schedule_work_settings_callback(update: Update, context: ContextTypes.
     await query.answer()
     has_custom = schedule_manager.get_work_settings() is not None
     workdays, start_hour, end_hour = get_effective_work_settings()
-    status_text = "Используются настройки по умолчанию" if not has_custom else "Используются пользовательские настройки"
+    manual_schedule = get_manual_schedule()
+    manual_active = bool(manual_schedule)
+    status_parts = []
+    status_parts.append("Используются настройки по умолчанию" if not has_custom else "Используются пользовательские настройки")
+    if manual_active:
+        status_parts.append("Ручное расписание активно — клиенты видят только выбранные вручную слоты.")
+    status_text = "\n".join(status_parts)
+    manual_lines = []
+    if manual_active:
+        for day in sorted(manual_schedule.keys()):
+            times = ", ".join(manual_schedule[day])
+            manual_lines.append(f"{WEEKDAYS_RU_SHORT[day]}: {times}")
+    manual_block = "\n".join(manual_lines) if manual_lines else "нет выбранных слотов"
     await query.edit_message_text(
         f"⚙️ <b>Настройка рабочего времени</b>\n\n"
         f"Текущие настройки:\n"
         f"Дни: {', '.join([WEEKDAYS_RU_SHORT[d] for d in sorted(workdays)])}\n"
         f"Часы: {start_hour:02d}:00 - {end_hour:02d}:00\n\n"
-        f"{status_text}",
+        f"{status_text}"
+        + ("\n\nРучные слоты:\n" + manual_block if manual_active else ""),
         parse_mode=ParseMode.HTML,
-        reply_markup=build_work_settings_keyboard(has_custom),
+        reply_markup=build_work_settings_keyboard(has_custom, manual_active),
     )
 
 
@@ -1525,6 +1597,7 @@ async def work_days_apply_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer("Дни недели обновлены ✅", show_alert=True)
     # Return to settings menu
     has_custom = True
+    manual_active = has_manual_schedule()
     workdays = selected_days
     status_text = "Используются пользовательские настройки"
     await query.edit_message_text(
@@ -1534,7 +1607,7 @@ async def work_days_apply_callback(update: Update, context: ContextTypes.DEFAULT
         f"Часы: {start_hour:02d}:00 - {end_hour:02d}:00\n\n"
         f"{status_text}",
         parse_mode=ParseMode.HTML,
-        reply_markup=build_work_settings_keyboard(has_custom),
+        reply_markup=build_work_settings_keyboard(has_custom, manual_active),
     )
 
 
@@ -1633,6 +1706,7 @@ async def work_hours_apply_callback(update: Update, context: ContextTypes.DEFAUL
     await query.answer("Часы работы обновлены ✅", show_alert=True)
     # Return to settings menu
     has_custom = True
+    manual_active = has_manual_schedule()
     status_text = "Используются пользовательские настройки"
     await query.edit_message_text(
         f"⚙️ <b>Настройка рабочего времени</b>\n\n"
@@ -1641,7 +1715,7 @@ async def work_hours_apply_callback(update: Update, context: ContextTypes.DEFAUL
         f"Часы: {start_hour:02d}:00 - {end_hour:02d}:00\n\n"
         f"{status_text}",
         parse_mode=ParseMode.HTML,
-        reply_markup=build_work_settings_keyboard(has_custom),
+        reply_markup=build_work_settings_keyboard(has_custom, manual_active),
     )
 
 
@@ -1653,10 +1727,12 @@ async def work_settings_reset_callback(update: Update, context: ContextTypes.DEF
         return
     await query.answer()
     schedule_manager.clear_work_settings()
+    schedule_manager.clear_manual_slots()
     refresh_daily_slots()
     await query.answer("Настройки сброшены к значениям по умолчанию ✅", show_alert=True)
     workdays, start_hour, end_hour = get_effective_work_settings()
     has_custom = False
+    manual_active = has_manual_schedule()
     status_text = "Используются настройки по умолчанию"
     await query.edit_message_text(
         f"⚙️ <b>Настройка рабочего времени</b>\n\n"
@@ -1665,7 +1741,130 @@ async def work_settings_reset_callback(update: Update, context: ContextTypes.DEF
         f"Часы: {start_hour:02d}:00 - {end_hour:02d}:00\n\n"
         f"{status_text}",
         parse_mode=ParseMode.HTML,
-        reply_markup=build_work_settings_keyboard(has_custom),
+        reply_markup=build_work_settings_keyboard(has_custom, manual_active),
+    )
+
+
+async def manual_slots_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show manual schedule overview."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    manual_schedule = get_manual_schedule()
+    text_lines = [
+        "🧩 <b>Ручное расписание</b>\n",
+        "Добавьте конкретные часы для каждого дня недели.",
+        "Клиенты будут видеть только эти слоты (закрытые дни/часы имеют приоритет).",
+        "",
+        "Выберите день, чтобы отметить часы:",
+    ]
+    if not manual_schedule:
+        text_lines.insert(1, "Пока ничего не выбрано — используются стандартные дни/часы.")
+    keyboard = build_manual_schedule_keyboard(manual_schedule)
+    await query.edit_message_text(
+        "\n".join(text_lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def manual_day_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show manual slot toggles for a weekday."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, weekday_str = query.data.split("|", maxsplit=1)
+    weekday = int(weekday_str)
+    manual_schedule = get_manual_schedule()
+    selected = manual_schedule.get(weekday, [])
+    day_label = WEEKDAYS_RU_FULL[weekday]
+    keyboard = build_manual_day_times_keyboard(weekday, MANUAL_TIME_OPTIONS, selected)
+    await query.edit_message_text(
+        f"🧩 <b>{day_label.title()}</b>\n\n"
+        "Нажмите на час, чтобы добавить или убрать слот. Можно выбрать несколько часов.\n"
+        "Диапазон фиксирован: 00:00–23:00, шаг 1 час.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def manual_slot_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle specific manual slot for weekday."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, weekday_str, time_str = query.data.split("|", maxsplit=2)
+    weekday = int(weekday_str)
+    if time_str not in MANUAL_TIME_OPTIONS:
+        await query.answer("Недопустимое время", show_alert=True)
+        return
+    manual_schedule = get_manual_schedule()
+    current = set(manual_schedule.get(weekday, []))
+    if time_str in current:
+        current.remove(time_str)
+        feedback = "Слот удалён ✅"
+    else:
+        current.add(time_str)
+        feedback = "Слот добавлен ✅"
+    new_values = sorted(current)
+    schedule_manager.set_manual_slots_for_weekday(weekday, new_values)
+    refresh_daily_slots()
+    await query.answer(feedback, show_alert=True)
+    keyboard = build_manual_day_times_keyboard(weekday, MANUAL_TIME_OPTIONS, new_values)
+    day_label = WEEKDAYS_RU_FULL[weekday]
+    await query.edit_message_text(
+        f"🧩 <b>{day_label.title()}</b>\n\n"
+        "Нажмите на час, чтобы добавить или убрать слот. Можно выбрать несколько часов.\n"
+        "Диапазон фиксирован: 00:00–23:00, шаг 1 час.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def manual_day_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear manual slots for a single weekday."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, weekday_str = query.data.split("|", maxsplit=1)
+    weekday = int(weekday_str)
+    schedule_manager.set_manual_slots_for_weekday(weekday, [])
+    refresh_daily_slots()
+    await query.answer("Слоты дня очищены ✅", show_alert=True)
+    manual_schedule = get_manual_schedule()
+    keyboard = build_manual_schedule_keyboard(manual_schedule)
+    await query.edit_message_text(
+        "🧩 <b>Ручное расписание</b>\n\nВыберите день, чтобы отметить часы:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def manual_clear_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove all manual slots."""
+    query = update.callback_query
+    if not is_instructor(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    schedule_manager.clear_manual_slots()
+    refresh_daily_slots()
+    await query.answer("Ручное расписание очищено ✅", show_alert=True)
+    manual_schedule = get_manual_schedule()
+    keyboard = build_manual_schedule_keyboard(manual_schedule)
+    await query.edit_message_text(
+        "🧩 <b>Ручное расписание</b>\n\n"
+        "Пока ничего не выбрано — используются стандартные дни/часы.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
     )
 
 
@@ -1798,7 +1997,11 @@ async def regular_client_weekday_callback(update: Update, context: ContextTypes.
     user_id = int(user_id_str)
     weekday = int(weekday_str)
     refresh_daily_slots()
-    keyboard = build_regular_client_time_keyboard(user_id, weekday, daily_slots)
+    available_times = get_slots_for_weekday(weekday)
+    if not available_times:
+        await query.answer("Для этого дня нет свободных слотов. Добавьте их в ручном расписании.", show_alert=True)
+        return
+    keyboard = build_regular_client_time_keyboard(user_id, weekday, available_times)
     weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     await query.edit_message_text(
         f"📅 <b>Назначить слот постоянному клиенту</b>\n\n"
@@ -1967,7 +2170,7 @@ async def group_slots_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     refresh_daily_slots()
     group_slots = schedule_manager.get_group_slots()
-    keyboard = build_group_slots_keyboard(group_slots, daily_slots)
+    keyboard = build_group_slots_keyboard(group_slots, [])
     await query.edit_message_text(
         "👥 <b>Групповые слоты</b>\n\n"
         "Групповые слоты — это дни недели и время, когда можно записываться нескольким клиентам одновременно.\n"
@@ -2003,7 +2206,18 @@ async def group_slot_weekday_callback(update: Update, context: ContextTypes.DEFA
     _, weekday_str = query.data.split("|", maxsplit=1)
     weekday = int(weekday_str)
     refresh_daily_slots()
-    keyboard = build_add_group_slot_time_keyboard(weekday, daily_slots)
+    available_times = get_slots_for_weekday(weekday)
+    if not available_times:
+        await query.answer("Для этого дня нет рабочих слотов. Добавьте их в ручном расписании.", show_alert=True)
+        keyboard = build_add_group_slot_weekday_keyboard()
+        await query.edit_message_text(
+            "➕ <b>Добавить групповой слот</b>\n\n"
+            "Сначала добавьте часы в ручном расписании или выберите другой день:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+    keyboard = build_add_group_slot_time_keyboard(weekday, available_times)
     weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     await query.edit_message_text(
         f"➕ <b>Добавить групповой слот</b>\n\n"
@@ -2028,7 +2242,7 @@ async def group_slot_time_callback(update: Update, context: ContextTypes.DEFAULT
     # Refresh the list
     refresh_daily_slots()
     group_slots = schedule_manager.get_group_slots()
-    keyboard = build_group_slots_keyboard(group_slots, daily_slots)
+    keyboard = build_group_slots_keyboard(group_slots, [])
     await query.edit_message_text(
         "👥 <b>Групповые слоты</b>\n\n"
         "Групповые слоты — это дни недели и время, когда можно записываться нескольким клиентам одновременно.\n"
@@ -2052,7 +2266,7 @@ async def remove_group_slot_callback(update: Update, context: ContextTypes.DEFAU
     # Refresh the list
     refresh_daily_slots()
     group_slots = schedule_manager.get_group_slots()
-    keyboard = build_group_slots_keyboard(group_slots, daily_slots)
+    keyboard = build_group_slots_keyboard(group_slots, [])
     await query.edit_message_text(
         "👥 <b>Групповые слоты</b>\n\n"
         "Групповые слоты — это дни недели и время, когда можно записываться нескольким клиентам одновременно.\n"
@@ -2452,6 +2666,11 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(work_end_callback, pattern=r"^WORK_END\|"))
     application.add_handler(CallbackQueryHandler(work_hours_apply_callback, pattern=r"^WORK_HOURS_APPLY$"))
     application.add_handler(CallbackQueryHandler(work_settings_reset_callback, pattern=r"^WORK_SETTINGS_RESET$"))
+    application.add_handler(CallbackQueryHandler(manual_slots_menu_callback, pattern=r"^MANUAL_SLOTS_MENU$"))
+    application.add_handler(CallbackQueryHandler(manual_day_callback, pattern=r"^MANUAL_DAY\|"))
+    application.add_handler(CallbackQueryHandler(manual_slot_toggle_callback, pattern=r"^MANUAL_SLOT\|"))
+    application.add_handler(CallbackQueryHandler(manual_day_clear_callback, pattern=r"^MANUAL_DAY_CLEAR\|"))
+    application.add_handler(CallbackQueryHandler(manual_clear_all_callback, pattern=r"^MANUAL_CLEAR$"))
     # Regular clients handlers
     application.add_handler(CallbackQueryHandler(regular_clients_callback, pattern=r"^REGULAR_CLIENTS$"))
     application.add_handler(CallbackQueryHandler(add_regular_client_callback, pattern=r"^ADD_REGULAR_CLIENT$"))

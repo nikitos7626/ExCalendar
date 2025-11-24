@@ -300,11 +300,17 @@ def build_schedule_weeks_keyboard(
     return InlineKeyboardMarkup(buttons)
 
 
-def build_work_settings_keyboard(has_custom: bool) -> InlineKeyboardMarkup:
+def build_work_settings_keyboard(has_custom: bool, manual_active: bool) -> InlineKeyboardMarkup:
     """Build main work settings keyboard."""
     buttons = [
         [InlineKeyboardButton("📅 Настроить дни недели", callback_data="WORK_SETTINGS_DAYS")],
         [InlineKeyboardButton("🕐 Настроить часы работы", callback_data="WORK_SETTINGS_HOURS")],
+        [
+            InlineKeyboardButton(
+                ("🧩 Ручное расписание (вкл)" if manual_active else "🧩 Ручное расписание"),
+                callback_data="MANUAL_SLOTS_MENU",
+            )
+        ],
     ]
     if has_custom:
         buttons.append([InlineKeyboardButton("🔄 Сбросить к настройкам по умолчанию", callback_data="WORK_SETTINGS_RESET")])
@@ -377,6 +383,67 @@ def build_work_hours_keyboard(start_hour: int, end_hour: int) -> InlineKeyboardM
     
     buttons.append([InlineKeyboardButton("✅ Применить", callback_data="WORK_HOURS_APPLY")])
     buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="SCHEDULE_WORK_SETTINGS")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_manual_schedule_keyboard(manual_schedule: Dict[int, List[str]]) -> InlineKeyboardMarkup:
+    """Build overview keyboard for manual day/time slots."""
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for idx, label in enumerate(weekdays):
+        slot_count = len(manual_schedule.get(idx, []))
+        emoji = "✅" if slot_count else "➕"
+        row.append(
+            InlineKeyboardButton(
+                f"{emoji} {label} · {slot_count}",
+                callback_data=f"MANUAL_DAY|{idx}",
+            )
+        )
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([
+        InlineKeyboardButton(
+            "🧹 Очистить ручное расписание",
+            callback_data="MANUAL_CLEAR",
+        )
+    ])
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="SCHEDULE_WORK_SETTINGS")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_manual_day_times_keyboard(
+    weekday: int,
+    time_options: List[str],
+    selected_times: List[str],
+) -> InlineKeyboardMarkup:
+    """Build keyboard for toggling manual slots within a weekday."""
+    selected = set(selected_times)
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for time_str in time_options:
+        emoji = "✅" if time_str in selected else "➕"
+        row.append(
+            InlineKeyboardButton(
+                f"{emoji} {time_str}",
+                callback_data=f"MANUAL_SLOT|{weekday}|{time_str}",
+            )
+        )
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([
+        InlineKeyboardButton(
+            "🧹 Очистить день",
+            callback_data=f"MANUAL_DAY_CLEAR|{weekday}",
+        )
+    ])
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="MANUAL_SLOTS_MENU")])
     return InlineKeyboardMarkup(buttons)
 
 

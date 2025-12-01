@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .config import settings
+from .config import load_settings
 from .db import get_connection
 
 
@@ -44,7 +44,7 @@ class BookingStore:
         Возвращает id тренера, к которому сейчас привязываем все брони.
         Пока что это первый INSTRUCTOR_CHAT_ID из настроек.
         """
-        main_admin_ids = settings.instructor_chat_ids
+        main_admin_ids = load_settings().instructor_chat_ids
         if not main_admin_ids:
             raise RuntimeError("No INSTRUCTOR_CHAT_ID configured")
         main_admin_telegram_id = main_admin_ids[0]

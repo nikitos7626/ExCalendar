@@ -19,7 +19,7 @@ class BookingRequest:
     time: str  # HH:MM
     status: str  # pending|confirmed|declined|cancelled_by_client|cancelled_by_trainer
     created_at: str
-    reminder_sent: bool = False  # Whether 2-hour reminder was sent
+    reminder_sent: bool = False # Whether 2-hour reminder was sent
 
 
 class BookingStore:

@@ -32,6 +32,8 @@ WEEKDAY_ALIASES = {
 class Settings:
     bot_token: str
     instructor_chat_ids: List[int]  # List of admin/instructor chat IDs
+    database_url: str | None
+    bot_username: str | None
     timezone: str
     workdays: List[int]
     work_start_hour: int
@@ -89,6 +91,8 @@ def load_settings(env_file: str | None = None) -> Settings:
         raise RuntimeError("INSTRUCTOR_CHAT_ID must contain at least one valid ID")
 
     timezone = os.getenv("TIMEZONE", "Europe/Moscow")
+    database_url = os.getenv("DATABASE_URL") or None
+    bot_username = os.getenv("BOT_USERNAME") or None
     workdays = _parse_workdays(os.getenv("WORKING_DAYS"))
     work_start_hour = int(os.getenv("WORK_START_HOUR", "8"))
     work_end_hour = int(os.getenv("WORK_END_HOUR", "22"))
@@ -106,6 +110,8 @@ def load_settings(env_file: str | None = None) -> Settings:
     return Settings(
         bot_token=bot_token,
         instructor_chat_ids=instructor_chat_ids,
+        database_url=database_url,
+        bot_username=bot_username,
         timezone=timezone,
         workdays=workdays,
         work_start_hour=work_start_hour,

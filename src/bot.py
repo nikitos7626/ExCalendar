@@ -21,7 +21,7 @@ from telegram.ext import (
 from .booking_store import BookingStore, BookingRequest
 from .config import Settings, load_settings
 from .schedule_manager import ScheduleManager
-from .db import run_migrations, ensure_initial_trainers
+from .db import run_migrations, ensure_initial_trainers, ensure_trainer_with_invite
 from .keyboards import (
     build_admin_cancel_keyboard,
     build_admin_cancel_reason_keyboard,
@@ -1432,6 +1432,45 @@ async def schedule_weeks_page_callback(update: Update, context: ContextTypes.DEF
     )
 
 
+async def trainer_share_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send personal booking link for trainer to share with clients."""
+    query = update.callback_query
+    user = query.from_user
+    if not is_instructor(user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+
+    # Ensure trainer exists in DB and has invite_code
+    invite_code = ensure_trainer_with_invite(
+        telegram_id=user.id,
+        username=user.username,
+        full_name=user.full_name or user.first_name,
+    )
+
+    # Determine bot username for deep link
+    bot_username = settings.bot_username
+    if not bot_username:
+        me = await context.bot.get_me()
+        bot_username = me.username
+
+    deep_link = f"https://t.me/{bot_username}?start={invite_code}"
+
+    text = (
+        "📤 <b>Ссылка для клиентов</b>\n\n"
+        "Отправьте эту ссылку клиентам — по ней они откроют бот и будут записываться именно к вам:\n\n"
+        f"<code>{deep_link}</code>"
+    )
+
+    # Отправляем отдельным сообщением, чтобы не ломать текущее меню
+    await context.bot.send_message(
+        chat_id=user.id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_main_keyboard(user.id),
+    )
+
+
 async def schedule_week_block_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Block entire week."""
     query = update.callback_query
@@ -2667,6 +2706,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(work_end_callback, pattern=r"^WORK_END\|"))
     application.add_handler(CallbackQueryHandler(work_hours_apply_callback, pattern=r"^WORK_HOURS_APPLY$"))
     application.add_handler(CallbackQueryHandler(work_settings_reset_callback, pattern=r"^WORK_SETTINGS_RESET$"))
+    application.add_handler(CallbackQueryHandler(trainer_share_link_callback, pattern=r"^TRAINER_SHARE_LINK$"))
     application.add_handler(CallbackQueryHandler(manual_slots_menu_callback, pattern=r"^MANUAL_SLOTS_MENU$"))
     application.add_handler(CallbackQueryHandler(manual_day_callback, pattern=r"^MANUAL_DAY\|"))
     application.add_handler(CallbackQueryHandler(manual_slot_toggle_callback, pattern=r"^MANUAL_SLOT\|"))

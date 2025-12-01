@@ -4,6 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Optional, List
+import uuid
 
 import psycopg2
 from psycopg2.extras import register_default_jsonb
@@ -160,6 +161,75 @@ def ensure_initial_trainers() -> None:
         logger.info("Initial trainers synced from INSTRUCTOR_CHAT_ID.")
     finally:
         conn.close()
+
+
+def ensure_trainer_with_invite(
+    telegram_id: int,
+    username: str | None,
+    full_name: str | None,
+) -> str:
+    """
+    Ensure trainer row exists for given telegram_id and has invite_code.
+
+    Returns invite_code.
+    """
+    settings = load_settings()
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Try to get existing trainer
+                cur.execute(
+                    """
+                    SELECT id, invite_code
+                    FROM trainers
+                    WHERE telegram_id = %s
+                    """,
+                    (telegram_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    trainer_id, invite_code = row
+                    if invite_code:
+                        return invite_code
+                    # Generate new invite code
+                    invite_code = uuid.uuid4().hex
+                    cur.execute(
+                        """
+                        UPDATE trainers
+                        SET invite_code = %s,
+                            username = COALESCE(%s, username),
+                            full_name = COALESCE(%s, full_name)
+                        WHERE id = %s
+                        """,
+                        (invite_code, username, full_name or f"Trainer {telegram_id}", trainer_id),
+                    )
+                    return invite_code
+
+                # No trainer yet – create one
+                # Mark as main admin if in INSTRUCTOR_CHAT_ID list and is first element
+                instructor_ids: List[int] = settings.instructor_chat_ids
+                is_main_admin = bool(instructor_ids and telegram_id == instructor_ids[0])
+                invite_code = uuid.uuid4().hex
+                cur.execute(
+                    """
+                    INSERT INTO trainers (telegram_id, full_name, username, is_main_admin, invite_code)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING invite_code
+                    """,
+                    (
+                        telegram_id,
+                        full_name or f"Trainer {telegram_id}",
+                        username,
+                        is_main_admin,
+                        invite_code,
+                    ),
+                )
+                (invite_code,) = cur.fetchone()
+                return invite_code
+    finally:
+        conn.close()
+
 
 
 

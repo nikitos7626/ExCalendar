@@ -10,6 +10,20 @@ from typing import Dict, List, Optional
 from .config import load_settings
 from .db import get_connection
 
+# Cache settings at module level to avoid re-reading config on every call
+_settings_cache = None
+_settings_lock = threading.Lock()
+
+
+def _get_cached_settings():
+    """Get settings, caching them after first load."""
+    global _settings_cache
+    if _settings_cache is None:
+        with _settings_lock:
+            if _settings_cache is None:
+                _settings_cache = load_settings()
+    return _settings_cache
+
 
 @dataclass(slots=True)
 class BookingRequest:
@@ -44,7 +58,7 @@ class BookingStore:
         Возвращает id тренера, к которому сейчас привязываем все брони.
         Пока что это первый INSTRUCTOR_CHAT_ID из настроек.
         """
-        main_admin_ids = load_settings().instructor_chat_ids
+        main_admin_ids = _get_cached_settings().instructor_chat_ids
         if not main_admin_ids:
             raise RuntimeError("No INSTRUCTOR_CHAT_ID configured")
         main_admin_telegram_id = main_admin_ids[0]

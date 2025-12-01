@@ -187,6 +187,7 @@ def build_schedule_manage_keyboard(user_id: int | None = None, is_main_admin: bo
         [InlineKeyboardButton("📅 Управление днями", callback_data="SCHEDULE_DAYS")],
         [InlineKeyboardButton("📆 Управление неделями", callback_data="SCHEDULE_WEEKS")],
         [InlineKeyboardButton("⚙️ Настройка рабочего времени", callback_data="SCHEDULE_WORK_SETTINGS")],
+        [InlineKeyboardButton("📤 Ссылка для клиентов", callback_data="TRAINER_SHARE_LINK")],
         [InlineKeyboardButton("👥 Постоянные клиенты", callback_data="REGULAR_CLIENTS")],
         [InlineKeyboardButton("👥 Групповые слоты", callback_data="GROUP_SLOTS")],
     ]

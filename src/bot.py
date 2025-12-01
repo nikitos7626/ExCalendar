@@ -21,7 +21,7 @@ from telegram.ext import (
 from .booking_store import BookingStore, BookingRequest
 from .config import Settings, load_settings
 from .schedule_manager import ScheduleManager
-from .db import run_migrations
+from .db import run_migrations, ensure_initial_trainers
 from .keyboards import (
     build_admin_cancel_keyboard,
     build_admin_cancel_reason_keyboard,
@@ -2735,13 +2735,13 @@ def ensure_event_loop() -> None:
 
 
 if __name__ == "__main__":
-    # Phase 1: ensure database schema exists (if DATABASE_URL configured).
+    # Ensure database schema and initial trainers exist.
     try:
         run_migrations()
+        ensure_initial_trainers()
     except Exception as e:
-        logger.error(f"Failed to run database migrations: {e}")
-        # We deliberately do NOT abort startup yet, as the bot still uses JSON storage.
-        # In Phase 2, when storage is moved to DB, this will become a fatal error.
+        logger.error(f"Failed to initialize database: {e}")
+        # После полного перехода на БД отсутствие подключения станет критичной ошибкой.
     ensure_event_loop()
     main()
 

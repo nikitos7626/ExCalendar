@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 import psycopg2
 from psycopg2.extras import register_default_jsonb
@@ -128,5 +128,38 @@ def run_migrations() -> None:
         logger.info("Database migrations applied successfully.")
     finally:
         conn.close()
+
+
+def ensure_initial_trainers() -> None:
+    """
+    Ensure that trainers table has rows for all INSTRUCTOR_CHAT_ID from config.
+
+    Пока только создаём (если нет) и помечаем первого как is_main_admin = TRUE.
+    """
+    settings = load_settings()
+    instructor_ids: List[int] = settings.instructor_chat_ids
+    if not instructor_ids:
+        return
+
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Ensure each instructor exists as trainer
+                for idx, telegram_id in enumerate(instructor_ids):
+                    is_main_admin = idx == 0
+                    cur.execute(
+                        """
+                        INSERT INTO trainers (telegram_id, full_name, username, is_main_admin)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (telegram_id) DO UPDATE
+                        SET is_main_admin = trainers.is_main_admin OR EXCLUDED.is_main_admin
+                        """,
+                        (telegram_id, f"Trainer {telegram_id}", None, is_main_admin),
+                    )
+        logger.info("Initial trainers synced from INSTRUCTOR_CHAT_ID.")
+    finally:
+        conn.close()
+
 
 

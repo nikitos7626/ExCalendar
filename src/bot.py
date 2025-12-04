@@ -21,7 +21,7 @@ from telegram.ext import (
 from .booking_store import BookingStore, BookingRequest
 from .config import Settings, load_settings
 from .schedule_manager import ScheduleManager
-from .db import run_migrations, ensure_initial_trainers, ensure_trainer_with_invite
+from .db import run_migrations, ensure_initial_trainers, _init_connection_pool, get_trainer_invite_code, ensure_trainer_with_invite
 from .keyboards import (
     build_admin_cancel_keyboard,
     build_admin_cancel_reason_keyboard,
@@ -323,6 +323,35 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     # Track user activity
     schedule_manager.track_user_activity(user.id)
+    
+    # Check if user is a trainer - show welcome with invite link
+    if is_instructor(user.id):
+        invite_code = get_trainer_invite_code(user.id)
+        if invite_code:
+            # Determine bot username for deep link
+            bot_username = settings.bot_username
+            if not bot_username:
+                me = await context.bot.get_me()
+                bot_username = me.username
+            
+            deep_link = f"https://t.me/{bot_username}?start={invite_code}"
+            
+            welcome_text = (
+                "👋 <b>Добро пожаловать, тренер!</b>\n\n"
+                "Это ваша уникальная ссылка для клиентов. Отправьте её клиентам — "
+                "по ней они откроют бот и будут записываться именно к вам:\n\n"
+                f"<code>{deep_link}</code>\n\n"
+                "Вы также можете получить эту ссылку в любой момент через меню "
+                "«⚙️ Управление расписанием» → «📤 Ссылка для клиентов»."
+            )
+            await update.message.reply_text(
+                welcome_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_main_keyboard(user.id),
+            )
+            return
+    
+    # Regular client welcome
     await update.message.reply_text(
         "Привет! Я помогу записаться на индивидуальную тренировку.\n"
         "Нажми «📅 Записаться», чтобы выбрать дату и время (1 час).\n"
@@ -1441,12 +1470,17 @@ async def trainer_share_link_callback(update: Update, context: ContextTypes.DEFA
         return
     await query.answer()
 
-    # Ensure trainer exists in DB and has invite_code
-    invite_code = ensure_trainer_with_invite(
-        telegram_id=user.id,
-        username=user.username,
-        full_name=user.full_name or user.first_name,
-    )
+    # Get existing invite code (should always exist after ensure_initial_trainers)
+    invite_code = get_trainer_invite_code(user.id)
+    
+    if not invite_code:
+        # Fallback: ensure trainer exists and generate code if missing
+        from .db import ensure_trainer_with_invite
+        invite_code = ensure_trainer_with_invite(
+            telegram_id=user.id,
+            username=user.username,
+            full_name=user.full_name or user.first_name,
+        )
 
     # Determine bot username for deep link
     bot_username = settings.bot_username
@@ -2663,26 +2697,32 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error(f"Error processing reminder for request {request.id}: {e}")
 
 
-def main() -> None:
-    application = Application.builder().token(settings.bot_token).build()
-
+def register_handlers(application: Application) -> None:
+    """Register all bot handlers organized by functionality."""
+    
+    # Command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("book", start_booking))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("stats", stats_command))
-
+    
+    # Booking flow handlers
     application.add_handler(CallbackQueryHandler(date_callback, pattern=r"^DATE\|"))
     application.add_handler(CallbackQueryHandler(time_callback, pattern=r"^TIME\|"))
     application.add_handler(CallbackQueryHandler(back_to_dates, pattern=r"^BACK_TO_DATES"))
     application.add_handler(CallbackQueryHandler(dates_page_callback, pattern=r"^DATES\|"))
-    application.add_handler(CallbackQueryHandler(cancel_select_callback, pattern=r"^CANCEL\|"))
-    application.add_handler(CallbackQueryHandler(admin_cancel_select_callback, pattern=r"^ADMIN_CANCEL\|"))
+    
+    # Request review handlers
     application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^REVIEW\|"))
     application.add_handler(CallbackQueryHandler(decline_without_reason_callback, pattern=r"^DECLINE_SKIP\|"))
+    
+    # Cancellation handlers
+    application.add_handler(CallbackQueryHandler(cancel_select_callback, pattern=r"^CANCEL\|"))
     application.add_handler(CallbackQueryHandler(cancel_without_reason_callback, pattern=r"^CANCEL_SKIP\|"))
+    application.add_handler(CallbackQueryHandler(admin_cancel_select_callback, pattern=r"^ADMIN_CANCEL\|"))
     application.add_handler(CallbackQueryHandler(admin_cancel_without_reason_callback, pattern=r"^ADMIN_CANCEL_SKIP\|"))
-    application.add_handler(CallbackQueryHandler(ignore_callback, pattern=r"^IGNORE$"))
+    
     # Schedule management handlers
     application.add_handler(CallbackQueryHandler(schedule_menu_callback, pattern=r"^SCHEDULE_MENU$"))
     application.add_handler(CallbackQueryHandler(schedule_menu_callback, pattern=r"^SCHEDULE_BACK$"))
@@ -2696,6 +2736,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(schedule_weeks_page_callback, pattern=r"^SCHEDULE_WEEKS_PAGE\|"))
     application.add_handler(CallbackQueryHandler(schedule_week_block_callback, pattern=r"^SCHEDULE_WEEK_BLOCK\|"))
     application.add_handler(CallbackQueryHandler(schedule_week_unblock_callback, pattern=r"^SCHEDULE_WEEK_UNBLOCK\|"))
+    
     # Work settings handlers
     application.add_handler(CallbackQueryHandler(schedule_work_settings_callback, pattern=r"^SCHEDULE_WORK_SETTINGS$"))
     application.add_handler(CallbackQueryHandler(work_settings_days_callback, pattern=r"^WORK_SETTINGS_DAYS$"))
@@ -2707,11 +2748,14 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(work_hours_apply_callback, pattern=r"^WORK_HOURS_APPLY$"))
     application.add_handler(CallbackQueryHandler(work_settings_reset_callback, pattern=r"^WORK_SETTINGS_RESET$"))
     application.add_handler(CallbackQueryHandler(trainer_share_link_callback, pattern=r"^TRAINER_SHARE_LINK$"))
+    
+    # Manual schedule handlers
     application.add_handler(CallbackQueryHandler(manual_slots_menu_callback, pattern=r"^MANUAL_SLOTS_MENU$"))
     application.add_handler(CallbackQueryHandler(manual_day_callback, pattern=r"^MANUAL_DAY\|"))
     application.add_handler(CallbackQueryHandler(manual_slot_toggle_callback, pattern=r"^MANUAL_SLOT\|"))
     application.add_handler(CallbackQueryHandler(manual_day_clear_callback, pattern=r"^MANUAL_DAY_CLEAR\|"))
     application.add_handler(CallbackQueryHandler(manual_clear_all_callback, pattern=r"^MANUAL_CLEAR$"))
+    
     # Regular clients handlers
     application.add_handler(CallbackQueryHandler(regular_clients_callback, pattern=r"^REGULAR_CLIENTS$"))
     application.add_handler(CallbackQueryHandler(add_regular_client_callback, pattern=r"^ADD_REGULAR_CLIENT$"))
@@ -2722,12 +2766,14 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(regular_client_time_callback, pattern=r"^REGULAR_CLIENT_TIME\|"))
     application.add_handler(CallbackQueryHandler(regular_client_clear_slot_callback, pattern=r"^REGULAR_CLIENT_CLEAR_SLOT\|"))
     application.add_handler(CallbackQueryHandler(remove_regular_client_callback, pattern=r"^REMOVE_CLIENT\|"))
+    
     # Group slots handlers
     application.add_handler(CallbackQueryHandler(group_slots_callback, pattern=r"^GROUP_SLOTS$"))
     application.add_handler(CallbackQueryHandler(add_group_slot_callback, pattern=r"^ADD_GROUP_SLOT$"))
     application.add_handler(CallbackQueryHandler(group_slot_weekday_callback, pattern=r"^GROUP_SLOT_WEEKDAY\|"))
     application.add_handler(CallbackQueryHandler(group_slot_time_callback, pattern=r"^GROUP_SLOT_TIME\|"))
     application.add_handler(CallbackQueryHandler(remove_group_slot_callback, pattern=r"^REMOVE_GROUP_SLOT\|"))
+    
     # Trainers management handlers
     application.add_handler(CallbackQueryHandler(manage_trainers_callback, pattern=r"^MANAGE_TRAINERS$"))
     application.add_handler(CallbackQueryHandler(add_trainer_callback, pattern=r"^ADD_TRAINER$"))
@@ -2736,6 +2782,9 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(confirm_add_trainer_from_request_callback, pattern=r"^CFM_TR_REQ\|"))
     application.add_handler(CallbackQueryHandler(cancel_add_trainer_from_request_callback, pattern=r"^CNL_TR_REQ\|"))
     application.add_handler(CallbackQueryHandler(confirm_add_trainer_by_id_callback, pattern=r"^CFM_TR_ID\|"))
+    
+    # Utility handlers
+    application.add_handler(CallbackQueryHandler(ignore_callback, pattern=r"^IGNORE$"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
@@ -2744,6 +2793,11 @@ def main() -> None:
             menu_text_handler,
         )
     )
+
+
+def main() -> None:
+    application = Application.builder().token(settings.bot_token).build()
+    register_handlers(application)
 
     # Schedule reminder job to run every 5 minutes
     job_queue = application.job_queue
@@ -2779,6 +2833,8 @@ if __name__ == "__main__":
     try:
         run_migrations()
         ensure_initial_trainers()
+        # Initialize connection pool for faster DB access
+        _init_connection_pool()
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
         # После полного перехода на БД отсутствие подключения станет критичной ошибкой.

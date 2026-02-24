@@ -1,0 +1,11 @@
+.venv
+venv
+__pycache__
+*.pyc
+.git
+.env
+config.env
+*.md
+data/*.json
+.cursor
+mcps

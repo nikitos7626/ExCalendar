@@ -31,7 +31,8 @@ WEEKDAY_ALIASES = {
 @dataclass(slots=True, frozen=True)
 class Settings:
     bot_token: str
-    instructor_chat_ids: List[int]  # List of admin/instructor chat IDs
+    instructor_chat_ids: List[int]  # List of admin/instructor chat IDs (можно пустой, если заданы usernames)
+    instructor_usernames: List[str]  # Тренеры по @username (без @, lowercase)
     database_url: str | None
     bot_username: str | None
     timezone: str
@@ -40,6 +41,7 @@ class Settings:
     work_end_hour: int
     slot_duration_minutes: int
     booking_horizon_days: int
+    trainer_reminder_minutes: int  # За сколько минут напоминать тренеру о тренировке
     storage_path: Path
 
 
@@ -71,24 +73,32 @@ def load_settings(env_file: str | None = None) -> Settings:
         load_dotenv(".env", override=True)
 
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    instructor_chat_id_raw = os.getenv("INSTRUCTOR_CHAT_ID")
+    instructor_chat_id_raw = os.getenv("INSTRUCTOR_CHAT_ID", "").strip()
+    instructor_usernames_raw = os.getenv("INSTRUCTOR_USERNAMES", "").strip()
     if not bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-    if not instructor_chat_id_raw:
-        raise RuntimeError("INSTRUCTOR_CHAT_ID is not set")
-    
-    # Parse multiple IDs (comma-separated)
-    instructor_chat_ids = []
-    for id_str in instructor_chat_id_raw.split(","):
+
+    # Тренеры: по chat_id и/или по @username (без символа @)
+    instructor_chat_ids: List[int] = []
+    for id_str in instructor_chat_id_raw.split(",") if instructor_chat_id_raw else []:
         id_str = id_str.strip()
         if id_str:
             try:
                 instructor_chat_ids.append(int(id_str))
             except ValueError:
                 raise ValueError(f"Invalid INSTRUCTOR_CHAT_ID: {id_str} is not a valid integer")
-    
-    if not instructor_chat_ids:
-        raise RuntimeError("INSTRUCTOR_CHAT_ID must contain at least one valid ID")
+
+    instructor_usernames: List[str] = []
+    for u in instructor_usernames_raw.split(",") if instructor_usernames_raw else []:
+        u = u.strip().lstrip("@").lower()
+        if u and u not in instructor_usernames:
+            instructor_usernames.append(u)
+
+    if not instructor_chat_ids and not instructor_usernames:
+        raise RuntimeError(
+            "Set at least one of INSTRUCTOR_CHAT_ID or INSTRUCTOR_USERNAMES "
+            "(e.g. INSTRUCTOR_USERNAMES=nikit,coach)"
+        )
 
     timezone = os.getenv("TIMEZONE", "Europe/Moscow")
     database_url = os.getenv("DATABASE_URL") or None
@@ -100,6 +110,10 @@ def load_settings(env_file: str | None = None) -> Settings:
         max(int(os.getenv("BOOKING_HORIZON_DAYS", "14")), 1),
         30,
     )
+    trainer_reminder_minutes = min(
+        max(int(os.getenv("TRAINER_REMINDER_MINUTES", "15")), 1),
+        120,
+    )
 
     if work_end_hour <= work_start_hour:
         raise ValueError("WORK_END_HOUR must be greater than WORK_START_HOUR")
@@ -110,6 +124,7 @@ def load_settings(env_file: str | None = None) -> Settings:
     return Settings(
         bot_token=bot_token,
         instructor_chat_ids=instructor_chat_ids,
+        instructor_usernames=instructor_usernames,
         database_url=database_url,
         bot_username=bot_username,
         timezone=timezone,
@@ -118,6 +133,7 @@ def load_settings(env_file: str | None = None) -> Settings:
         work_end_hour=work_end_hour,
         slot_duration_minutes=60,
         booking_horizon_days=booking_horizon_days,
+        trainer_reminder_minutes=trainer_reminder_minutes,
         storage_path=data_dir / "bookings.json",
     )
 

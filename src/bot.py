@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import date, datetime, time, timedelta
-from typing import Dict, Iterable, List, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import pytz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
@@ -18,10 +20,28 @@ from telegram.ext import (
     filters,
 )
 
-from .booking_store import BookingStore, BookingRequest
 from .config import Settings, load_settings
 from .schedule_manager import ScheduleManager
-from .db import run_migrations, ensure_initial_trainers, _init_connection_pool, get_trainer_invite_code, ensure_trainer_with_invite
+from .models import BookingRequest
+from .repositories import run_migrations, ensure_initial_trainers
+from .repositories.trainer_repository import TrainerRepository
+from .repositories.client_repository import ClientRepository
+from .services import BookingService
+from .views.formatters import (
+    humanize_slot as fmt_humanize_slot,
+    format_day_short,
+    format_day_full,
+    STATUS_BADGES,
+    BUTTON_BOOK,
+    BUTTON_MY,
+    BUTTON_TRAINER,
+    BUTTON_MY_CLIENTS,
+    BUTTON_SCHEDULE,
+    BUTTON_STATS,
+    MENU_BUTTONS,
+    WEEKDAYS_RU_SHORT,
+    WEEKDAYS_RU_FULL,
+)
 from .keyboards import (
     build_admin_cancel_keyboard,
     build_admin_cancel_reason_keyboard,
@@ -30,6 +50,8 @@ from .keyboards import (
     build_add_regular_client_keyboard,
     build_cancel_reason_keyboard,
     build_cancel_select_keyboard,
+    build_day_before_confirm_keyboard,
+    build_day_decline_confirm_keyboard,
     build_confirm_add_trainer_by_id_keyboard,
     build_confirm_add_trainer_keyboard,
     build_dates_keyboard,
@@ -59,43 +81,87 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 
 
 settings: Settings = load_settings()
-store = BookingStore(settings.storage_path)
+booking_service = BookingService(settings.storage_path)
+trainer_repo = TrainerRepository()
+client_repo = ClientRepository()
 schedule_manager = ScheduleManager(settings.storage_path.parent / "schedule_blocks.json")
 timezone = pytz.timezone(settings.timezone)
 daily_slots = []
 CLIENT_CANCELABLE_STATUSES = {"pending", "confirmed"}
 TRAINER_CANCELABLE_STATUSES = {"pending", "confirmed"}
-STATUS_BADGES = {
-    "pending": "⌛ Ожидает подтверждения",
-    "confirmed": "✅ Подтверждена",
-    "cancelled_by_trainer": "🚫 Отменена тренером",
-    "cancelled_by_client": "🚫 Отменена клиентом",
-    "declined": "❌ Отклонена",
-}
-BUTTON_BOOK = "📅 Записаться"
-BUTTON_MY = "🗓 Мои записи"
-BUTTON_TRAINER = "📘 Записи тренера"
-BUTTON_SCHEDULE = "⚙️ Управление расписанием"
-BUTTON_STATS = "📊 Статистика"
-MENU_BUTTONS = {BUTTON_BOOK, BUTTON_MY, BUTTON_TRAINER, BUTTON_SCHEDULE, BUTTON_STATS}
 DATES_PAGE_SIZE = 6
 MANUAL_TIME_OPTIONS = [f"{hour:02d}:00" for hour in range(0, 24)]
 
+# Кэш: @username (lowercase) -> telegram_id для тренеров из INSTRUCTOR_USERNAMES (сохраняется в data/)
+INSTRUCTOR_USERNAME_IDS_PATH: Path = settings.storage_path.parent / "instructor_username_ids.json"
+_instructor_username_ids: Dict[str, int] = {}
 
-def is_instructor(user_id: int) -> bool:
-    """Check if user is an instructor (from config or dynamically added)."""
+
+def _load_instructor_username_ids() -> None:
+    global _instructor_username_ids
+    try:
+        if INSTRUCTOR_USERNAME_IDS_PATH.exists():
+            with open(INSTRUCTOR_USERNAME_IDS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _instructor_username_ids = {k: int(v) for k, v in (data or {}).items()}
+        else:
+            _instructor_username_ids = {}
+    except Exception as e:
+        logger.warning("Could not load instructor_username_ids: %s", e)
+        _instructor_username_ids = {}
+
+
+def _save_instructor_username_ids() -> None:
+    try:
+        INSTRUCTOR_USERNAME_IDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(INSTRUCTOR_USERNAME_IDS_PATH, "w", encoding="utf-8") as f:
+            json.dump(_instructor_username_ids, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Could not save instructor_username_ids: %s", e)
+
+
+_load_instructor_username_ids()
+
+
+def get_all_instructor_ids() -> Set[int]:
+    """Все chat_id тренеров: из конфига (ID + по username), плюс добавленные вручную."""
+    ids: Set[int] = set(settings.instructor_chat_ids)
+    ids.update(_instructor_username_ids.values())
+    ids.update(schedule_manager.get_all_trainer_ids())
+    return ids
+
+
+def is_instructor(user_id: int, username: Optional[str] = None) -> bool:
+    """Тренер: по chat_id, по @username из конфига или по кэшу (уже писали боту)."""
     if user_id in settings.instructor_chat_ids:
         return True
-    # Check dynamically added trainers
+    if user_id in _instructor_username_ids.values():
+        return True
     dynamic_trainer_ids = schedule_manager.get_all_trainer_ids()
-    return user_id in dynamic_trainer_ids
+    if user_id in dynamic_trainer_ids:
+        return True
+    if username:
+        un = username.strip().lstrip("@").lower()
+        if un in settings.instructor_usernames:
+            if _instructor_username_ids.get(un) != user_id:
+                _instructor_username_ids[un] = user_id
+                _save_instructor_username_ids()
+            return True
+    return False
 
 
 def is_main_admin(user_id: int) -> bool:
-    """Check if user is the main administrator (first ID from config.env)."""
-    if not settings.instructor_chat_ids:
-        return False
-    return user_id == settings.instructor_chat_ids[0]
+    """Главный админ: первый из INSTRUCTOR_CHAT_ID или первый @username в конфиге."""
+    if settings.instructor_chat_ids:
+        return user_id == settings.instructor_chat_ids[0]
+    if settings.instructor_usernames:
+        first_username = settings.instructor_usernames[0]
+        return _instructor_username_ids.get(first_username) == user_id
+    return False
+
+
+def humanize_slot(date_str: str, time_str: str) -> str:
+    return fmt_humanize_slot(date_str, time_str, timezone)
 
 
 async def send_to_all_instructors(
@@ -104,12 +170,8 @@ async def send_to_all_instructors(
     parse_mode: str | None = None,
     reply_markup=None,
 ) -> None:
-    """Send message to all instructors/admins (from config + dynamically added)."""
-    all_instructor_ids = set(settings.instructor_chat_ids)
-    # Add dynamically added trainers
-    dynamic_trainer_ids = schedule_manager.get_all_trainer_ids()
-    all_instructor_ids.update(dynamic_trainer_ids)
-    
+    """Отправить сообщение всем тренерам (по ID, по @username и добавленным вручную)."""
+    all_instructor_ids = get_all_instructor_ids()
     for chat_id in all_instructor_ids:
         try:
             await context.bot.send_message(
@@ -125,52 +187,12 @@ async def send_to_all_instructors(
 def build_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     if is_instructor(user_id):
         if is_main_admin(user_id):
-            rows = [[BUTTON_TRAINER], [BUTTON_SCHEDULE], [BUTTON_STATS]]
+            rows = [[BUTTON_TRAINER, BUTTON_MY_CLIENTS], [BUTTON_SCHEDULE], [BUTTON_STATS]]
         else:
-            rows = [[BUTTON_TRAINER], [BUTTON_SCHEDULE]]
+            rows = [[BUTTON_TRAINER, BUTTON_MY_CLIENTS], [BUTTON_SCHEDULE]]
     else:
         rows = [[BUTTON_BOOK, BUTTON_MY]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-MONTHS_RU_GEN = [
-    "января",
-    "февраля",
-    "марта",
-    "апреля",
-    "мая",
-    "июня",
-    "июля",
-    "августа",
-    "сентября",
-    "октября",
-    "ноября",
-    "декабря",
-]
-MONTHS_RU_SHORT = [
-    "янв",
-    "фев",
-    "мар",
-    "апр",
-    "мая",
-    "июн",
-    "июл",
-    "авг",
-    "сен",
-    "окт",
-    "ноя",
-    "дек",
-]
-WEEKDAYS_RU_FULL = [
-    "понедельник",
-    "вторник",
-    "среда",
-    "четверг",
-    "пятница",
-    "суббота",
-    "воскресенье",
-]
-WEEKDAYS_RU_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
-
 
 def get_effective_work_settings() -> Tuple[List[int], int, int]:
     """Get work settings from schedule_manager or fallback to config."""
@@ -279,14 +301,6 @@ def collect_available_dates_with_labels() -> Tuple[List[Tuple[date, str]], set[s
     return result, group_dates
 
 
-def format_day_short(day: date) -> str:
-    return f"{day.day:02d} {MONTHS_RU_SHORT[day.month - 1]} ({WEEKDAYS_RU_SHORT[day.weekday()]})"
-
-
-def format_day_full(day: date) -> str:
-    return f"{day.day:02d} {MONTHS_RU_GEN[day.month - 1]} ({WEEKDAYS_RU_FULL[day.weekday()]})"
-
-
 def find_dates_and_page(date_str: str) -> Tuple[List[Tuple[date, str]], int, bool, set[str]]:
     dates, group_dates = collect_available_dates_with_labels()
     page = 0
@@ -297,12 +311,6 @@ def find_dates_and_page(date_str: str) -> Tuple[List[Tuple[date, str]], int, boo
             found = True
             break
     return dates, page, found, group_dates
-
-
-def humanize_slot(date_str: str, time_str: str) -> str:
-    dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-    localized = timezone.localize(dt)
-    return f"{format_day_full(localized.date())} · {localized.strftime('%H:%M')}"
 
 
 def build_cancel_options(requests: List[BookingRequest]) -> List[Tuple[str, str]]:
@@ -316,7 +324,7 @@ def build_cancel_options(requests: List[BookingRequest]) -> List[Tuple[str, str]
 
 def cleanup_expired_requests() -> None:
     now_local = datetime.now(timezone).replace(tzinfo=None)
-    store.cleanup_expired(now_local)
+    booking_service.cleanup_expired(now_local)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -324,9 +332,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Track user activity
     schedule_manager.track_user_activity(user.id)
     
-    # Check if user is a trainer - show welcome with invite link
-    if is_instructor(user.id):
-        invite_code = get_trainer_invite_code(user.id)
+    # Check if user is a trainer - show welcome with invite link (по ID или @username)
+    if is_instructor(user.id, user.username):
+        invite_code = trainer_repo.get_invite_code(user.id)
+        if not invite_code:
+            invite_code = trainer_repo.ensure_with_invite(
+                telegram_id=user.id,
+                username=user.username,
+                full_name=user.full_name or user.first_name or "",
+            )
         if invite_code:
             # Determine bot username for deep link
             bot_username = settings.bot_username
@@ -351,6 +365,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
     
+    # Если клиент перешёл по ссылке тренера — сохраняем реферала
+    if context.args and len(context.args) >= 1:
+        client_repo.ensure_referred_by(
+            telegram_id=user.id,
+            full_name=user.full_name or "",
+            username=user.username,
+            invite_code=context.args[0],
+        )
+
     # Regular client welcome
     await update.message.reply_text(
         "Привет! Я помогу записаться на индивидуальную тренировку.\n"
@@ -401,8 +424,8 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Get user statistics
     user_stats = schedule_manager.get_user_stats_summary()
     
-    # Get booking statistics
-    all_requests = store.list_all_requests()
+    # Get booking statistics (все заявки по всем тренерам для общей статистики)
+    all_requests = booking_service.list_all_requests()
     total_bookings = len(all_requests)
     confirmed_bookings = len([r for r in all_requests if r.status == "confirmed"])
     pending_bookings = len([r for r in all_requests if r.status == "pending"])
@@ -461,11 +484,17 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    # Track user activity
     schedule_manager.track_user_activity(user.id)
     if is_instructor(user.id):
         await update.message.reply_text(
             "Тренеру недоступна запись. Используйте кнопку «📘 Записи тренера».",
+            reply_markup=build_main_keyboard(user.id),
+        )
+        return
+    # Запись только для тех, кто пришёл по ссылке тренера
+    if booking_service.get_trainer_id_for_client(user.id) is None:
+        await update.message.reply_text(
+            "Чтобы записаться, откройте бота по ссылке от вашего тренера — тогда станет доступна запись на тренировку.",
             reply_markup=build_main_keyboard(user.id),
         )
         return
@@ -496,7 +525,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     cleanup_expired_requests()
     requests = [
         req
-        for req in store.list_user_requests(user.id)
+        for req in booking_service.list_user_requests(user.id)
         if req.status in CLIENT_CANCELABLE_STATUSES
     ]
     if not requests:
@@ -520,7 +549,7 @@ async def show_instructor_bookings(update: Update, context: ContextTypes.DEFAULT
         )
         return
     cleanup_expired_requests()
-    requests = store.list_all_requests()
+    requests = booking_service.list_requests_for_trainer(update.effective_user.id)
     now = datetime.now(timezone)
     lines: List[str] = []
     options: List[Tuple[str, str]] = []
@@ -560,6 +589,35 @@ async def show_instructor_bookings(update: Update, context: ContextTypes.DEFAULT
         )
 
 
+async def show_my_referred_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать тренеру список клиентов, перешедших по его ссылке."""
+    user = update.effective_user
+    if not is_instructor(user.id):
+        await update.message.reply_text(
+            "Только тренер может просматривать этот список.",
+            reply_markup=build_main_keyboard(user.id),
+        )
+        return
+    clients = trainer_repo.get_clients_referred_by(user.id)
+    if not clients:
+        await update.message.reply_text(
+            "Пока ни один клиент не перешёл по вашей ссылке.\n\n"
+            "Отправьте клиентам вашу ссылку: «⚙️ Управление расписанием» → «📤 Ссылка для клиентов».",
+            reply_markup=build_main_keyboard(user.id),
+        )
+        return
+    lines = ["<b>👥 Клиенты по вашей ссылке</b>\n"]
+    for i, c in enumerate(clients, 1):
+        name = c["full_name"] or "Без имени"
+        username = f" (@{c['username']})" if c.get("username") else ""
+        lines.append(f"{i}. {name}{username}")
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_main_keyboard(user.id),
+    )
+
+
 async def date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -573,7 +631,14 @@ async def date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
     day_label = format_day_full(datetime.strptime(date_str, "%Y-%m-%d").date())
-    busy_map = store.list_day_states(date_str)
+    client_trainer_id = booking_service.get_trainer_id_for_client(query.from_user.id)
+    if client_trainer_id is None:
+        await query.edit_message_text(
+            "Чтобы записаться, откройте бота по ссылке от вашего тренера.",
+            reply_markup=build_main_keyboard(query.from_user.id),
+        )
+        return
+    busy_map = booking_service.list_day_states(date_str, trainer_id=client_trainer_id)
     blocked_slots = set(schedule_manager.get_blocked_slots_for_day(date_str))
     
     # Get group times for this date
@@ -649,7 +714,7 @@ async def time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     dates, page, _, group_dates = find_dates_and_page(date_str)
     user = query.from_user
     try:
-        request = store.create_request(
+        request = booking_service.create_request(
             user_id=user.id,
             username=user.username,
             full_name=user.full_name,
@@ -671,7 +736,8 @@ async def time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Я напомню, когда он подтвердит запись."
     )
 
-    bookings_count = store.get_slot_bookings_count(date_str, time_str)
+    trainer_id = request.trainer_id
+    bookings_count = booking_service.get_slot_bookings_count(date_str, time_str, trainer_id=trainer_id) if trainer_id else booking_service.get_slot_bookings_count(date_str, time_str)
     admin_text = (
         "<b>Новая заявка</b>\n"
         f"Дата: {humanize_slot(date_str, time_str)}\n"
@@ -681,28 +747,23 @@ async def time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     if is_group_slot:
         admin_text += f"\nЗаписей на этот слот: {bookings_count}"
-    # Send to first instructor with keyboard, others without
-    all_instructor_ids = list(settings.instructor_chat_ids) + schedule_manager.get_all_trainer_ids()
-    if all_instructor_ids:
-        first_admin_id = all_instructor_ids[0]
-        is_first_main_admin = is_main_admin(first_admin_id)
+    # Отправляем уведомление только тому тренеру, к которому записались (или первому админу для старых заявок без trainer_id)
+    trainer_telegram_id = trainer_repo.get_telegram_id_by_id(trainer_id) if trainer_id else None
+    if trainer_telegram_id is None and settings.instructor_chat_ids:
+        default_id = trainer_repo.get_default_trainer_id()
+        trainer_telegram_id = trainer_repo.get_telegram_id_by_id(default_id)
+    if trainer_telegram_id is not None:
+        is_first_main_admin = is_main_admin(trainer_telegram_id)
         is_client_already_trainer = is_instructor(user.id)
-        await context.bot.send_message(
-            chat_id=first_admin_id,
-            text=admin_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_request_review_keyboard(request.id, user.id, is_first_main_admin, is_client_already_trainer),
-        )
-        # Send to other instructors without keyboard
-        for chat_id in all_instructor_ids[1:]:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=admin_text,
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send message to instructor {chat_id}: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=trainer_telegram_id,
+                text=admin_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_request_review_keyboard(request.id, user.id, is_first_main_admin, is_client_already_trainer),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send new booking to trainer {trainer_telegram_id}: {e}")
 
 
 async def cancel_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -711,7 +772,7 @@ async def cancel_select_callback(update: Update, context: ContextTypes.DEFAULT_T
     _, request_id = query.data.split("|", maxsplit=1)
     user = query.from_user
     try:
-        request = store.get_request(request_id)
+        request = booking_service.get_request(request_id)
     except KeyError:
         await query.edit_message_text("Запись не найдена.")
         return
@@ -742,7 +803,7 @@ async def admin_cancel_select_callback(update: Update, context: ContextTypes.DEF
     await query.answer()
     _, request_id = query.data.split("|", maxsplit=1)
     try:
-        request = store.get_request(request_id)
+        request = booking_service.get_request(request_id)
     except KeyError:
         await query.edit_message_text("Запись не найдена.")
         return
@@ -790,7 +851,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     _, request_id, action = query.data.split("|", maxsplit=2)
     try:
-        request = store.get_request(request_id)
+        request = booking_service.get_request(request_id)
     except KeyError:
         await query.edit_message_text("Заявка не найдена или уже удалена.")
         return
@@ -976,10 +1037,13 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if text == BUTTON_MY:
         await cancel_command(update, context)
         return
-    if is_instructor(user.id) and text == BUTTON_TRAINER:
+    if is_instructor(user.id, user.username) and text == BUTTON_TRAINER:
         await show_instructor_bookings(update, context)
         return
-    if is_instructor(user.id) and text == BUTTON_SCHEDULE:
+    if is_instructor(user.id, user.username) and text == BUTTON_MY_CLIENTS:
+        await show_my_referred_clients(update, context)
+        return
+    if is_instructor(user.id, user.username) and text == BUTTON_SCHEDULE:
         await schedule_manage_command(update, context)
         return
     if is_main_admin(user.id) and text == BUTTON_STATS:
@@ -1001,7 +1065,7 @@ async def complete_decline_flow(
     if not pending or pending["request_id"] != request_id:
         return
     try:
-        request = store.get_request(request_id)
+        request = booking_service.get_request(request_id)
     except KeyError:
         context.chat_data.pop("awaiting_reason", None)
         return
@@ -1030,7 +1094,7 @@ async def complete_client_cancel_flow(
     if not pending or pending["request_id"] != request_id:
         return
     try:
-        request = store.get_request(request_id)
+        request = booking_service.get_request(request_id)
     except KeyError:
         await context.bot.send_message(chat_id=user.id, text="Запись не найдена или уже удалена.")
         context.user_data.pop("awaiting_cancel_reason", None)
@@ -1065,7 +1129,7 @@ async def complete_admin_cancel_flow(
     if not pending or pending["request_id"] != request_id:
         return
     try:
-        request = store.get_request(request_id)
+        request = booking_service.get_request(request_id)
     except KeyError:
         context.chat_data.pop("awaiting_admin_cancel", None)
         return
@@ -1095,7 +1159,7 @@ async def finalize_request_decision(
     edit_target: Tuple[int, int],
     reason: str | None = None,
 ) -> None:
-    updated = store.update_status(request.id, new_status)
+    updated = booking_service.update_status(request.id, new_status)
     status_text = "подтверждена ✅" if new_status == "confirmed" else "отклонена ❌"
     trainer_text = (
         f"Заявка {humanize_slot(updated.date, updated.time)} для {updated.full_name} {status_text}."
@@ -1129,7 +1193,7 @@ async def finalize_client_cancel(
     reason: str | None,
 ) -> None:
     previous_status = request.status
-    updated = store.update_status(request.id, "cancelled_by_client")
+    updated = booking_service.update_status(request.id, "cancelled_by_client")
     await context.bot.edit_message_text(
         chat_id=edit_target[0],
         message_id=edit_target[1],
@@ -1168,7 +1232,7 @@ async def finalize_trainer_cancel(
     reason: str | None,
 ) -> None:
     previous_status = request.status
-    updated = store.update_status(request.id, "cancelled_by_trainer")
+    updated = booking_service.update_status(request.id, "cancelled_by_trainer")
     text = (
         f"Тренировка {humanize_slot(updated.date, updated.time)} с {updated.full_name} отменена тренером."
     )
@@ -1471,12 +1535,10 @@ async def trainer_share_link_callback(update: Update, context: ContextTypes.DEFA
     await query.answer()
 
     # Get existing invite code (should always exist after ensure_initial_trainers)
-    invite_code = get_trainer_invite_code(user.id)
+    invite_code = trainer_repo.get_invite_code(user.id)
     
     if not invite_code:
-        # Fallback: ensure trainer exists and generate code if missing
-        from .db import ensure_trainer_with_invite
-        invite_code = ensure_trainer_with_invite(
+        invite_code = trainer_repo.ensure_with_invite(
             telegram_id=user.id,
             username=user.username,
             full_name=user.full_name or user.first_name,
@@ -1939,6 +2001,7 @@ async def manual_clear_all_callback(update: Update, context: ContextTypes.DEFAUL
         "Пока ничего не выбрано — используются стандартные дни/часы.",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
+        
     )
 
 
@@ -1968,7 +2031,7 @@ async def add_regular_client_callback(update: Update, context: ContextTypes.DEFA
         return
     await query.answer()
     # Get all unique clients from confirmed requests
-    all_clients = store.get_all_unique_clients()
+    all_clients = booking_service.get_all_unique_clients()
     # Filter out already regular clients
     regular_client_ids = {c["user_id"] for c in schedule_manager.get_regular_clients()}
     available_clients = [c for c in all_clients if c["user_id"] not in regular_client_ids]
@@ -1991,7 +2054,7 @@ async def add_client_confirm_callback(update: Update, context: ContextTypes.DEFA
     _, user_id_str = query.data.split("|", maxsplit=1)
     user_id = int(user_id_str)
     # Find client info
-    all_clients = store.get_all_unique_clients()
+    all_clients = booking_service.get_all_unique_clients()
     client = next((c for c in all_clients if c["user_id"] == user_id), None)
     if client:
         schedule_manager.add_regular_client(
@@ -2187,13 +2250,16 @@ async def create_regular_client_bookings(
         if schedule_manager.is_slot_blocked(date_str, time_str):
             continue
         
-        # Check if booking already exists
-        if store.get_slot_state(date_str, time_str):
+        # Только клиенты, привязанные к тренеру по ссылке
+        client_trainer_id = booking_service.get_trainer_id_for_client(user_id)
+        if client_trainer_id is None:
+            continue
+        if booking_service.get_slot_state(date_str, time_str, trainer_id=client_trainer_id):
             continue
         
         # Create confirmed booking
         try:
-            request = store.create_request(
+            request = booking_service.create_request(
                 user_id=user_id,
                 username=client.get("username", ""),
                 full_name=client.get("full_name", ""),
@@ -2202,7 +2268,7 @@ async def create_regular_client_bookings(
                 is_group_slot=False,
             )
             # Auto-confirm for regular clients
-            store.update_status(request.id, "confirmed")
+            booking_service.update_status(request.id, "confirmed")
             created_count += 1
         except ValueError:
             # Slot already booked, skip
@@ -2427,7 +2493,7 @@ async def add_trainer_from_request_callback(update: Update, context: ContextType
     user_id = int(user_id_str)
     
     try:
-        request = store.get_request(request_id)
+        request = booking_service.get_request(request_id)
     except KeyError:
         await query.answer("Заявка не найдена", show_alert=True)
         return
@@ -2471,7 +2537,7 @@ async def confirm_add_trainer_from_request_callback(update: Update, context: Con
     user_id = int(user_id_str)
     
     try:
-        request = store.get_request(request_id)
+        request = booking_service.get_request(request_id)
     except KeyError:
         await query.answer("Заявка не найдена", show_alert=True)
         return
@@ -2519,7 +2585,7 @@ async def cancel_add_trainer_from_request_callback(update: Update, context: Cont
     _, request_id = query.data.split("|", maxsplit=1)
     
     try:
-        request = store.get_request(request_id)
+        request = booking_service.get_request(request_id)
     except KeyError:
         await query.answer("Заявка не найдена", show_alert=True)
         return
@@ -2624,8 +2690,11 @@ async def sync_regular_client_bookings(context: ContextTypes.DEFAULT_TYPE) -> No
             if schedule_manager.is_slot_blocked(date_str, time_str):
                 continue
             
-            # Check if booking already exists
-            if store.get_slot_state(date_str, time_str):
+            # Только клиенты, привязанные к тренеру по ссылке
+            client_trainer_id = booking_service.get_trainer_id_for_client(user_id)
+            if client_trainer_id is None:
+                continue
+            if booking_service.get_slot_state(date_str, time_str, trainer_id=client_trainer_id):
                 continue
             
             # Create confirmed booking
@@ -2635,7 +2704,7 @@ async def sync_regular_client_bookings(context: ContextTypes.DEFAULT_TYPE) -> No
                 if not client:
                     continue
                 
-                request = store.create_request(
+                request = booking_service.create_request(
                     user_id=user_id,
                     username=client.get("username", ""),
                     full_name=client.get("full_name", ""),
@@ -2644,17 +2713,39 @@ async def sync_regular_client_bookings(context: ContextTypes.DEFAULT_TYPE) -> No
                     is_group_slot=False,
                 )
                 # Auto-confirm for regular clients
-                store.update_status(request.id, "confirmed")
+                booking_service.update_status(request.id, "confirmed")
             except ValueError:
                 # Slot already booked, skip
                 continue
 
 
 async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send reminders 2 hours before confirmed trainings."""
+    """Напоминания за 2 часа и уведомление за 1 день с подтверждением."""
     now = datetime.now(timezone)
-    upcoming = store.get_upcoming_confirmed(now)
-    
+    today_local = now.date()
+
+    # За день до тренировки: «Вы идёте?» с кнопками Подтверждаю / Отказаться
+    tomorrow_date = today_local + timedelta(days=1)
+    tomorrow_str = tomorrow_date.isoformat()
+    for request in booking_service.get_confirmed_for_tomorrow(tomorrow_str):
+        try:
+            slot_text = humanize_slot(request.date, request.time)
+            day_before_text = (
+                f"📅 Завтра у вас тренировка в {slot_text}.\n\n"
+                "Вы идёте на тренировку?"
+            )
+            await context.bot.send_message(
+                chat_id=request.user_id,
+                text=day_before_text,
+                reply_markup=build_day_before_confirm_keyboard(request.id),
+            )
+            booking_service.mark_day_before_reminder_sent(request.id)
+            logger.info(f"Day-before reminder sent for request {request.id} ({slot_text})")
+        except Exception as e:
+            logger.error(f"Error sending day-before reminder for {request.id}: {e}")
+
+    # За 2 часа до тренировки
+    upcoming = booking_service.get_upcoming_confirmed(now)
     for request in upcoming:
         try:
             slot_dt = timezone.localize(
@@ -2690,11 +2781,139 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
             await send_to_all_instructors(context, trainer_message)
             
             # Mark as sent
-            store.mark_reminder_sent(request.id)
+            booking_service.mark_reminder_sent(request.id)
             logger.info(f"Reminder sent for request {request.id} ({slot_text})")
             
         except Exception as e:
             logger.error(f"Error processing reminder for request {request.id}: {e}")
+
+    # Напоминание тренеру за N минут до тренировки
+    trainer_minutes = settings.trainer_reminder_minutes
+    for request in booking_service.get_upcoming_for_trainer_reminder(now, trainer_minutes, timezone):
+        try:
+            if not request.trainer_id:
+                continue
+            trainer_telegram_id = trainer_repo.get_telegram_id_by_id(request.trainer_id)
+            if trainer_telegram_id is None:
+                continue
+            slot_text = humanize_slot(request.date, request.time)
+            trainer_reminder_text = (
+                f"🔔 Через {trainer_minutes} мин. тренировка!\n"
+                f"Время: {slot_text}\n"
+                f"Клиент: {request.full_name} (@{request.username or 'нет'})"
+            )
+            await context.bot.send_message(chat_id=trainer_telegram_id, text=trainer_reminder_text)
+            booking_service.mark_trainer_reminder_sent(request.id)
+            logger.info(f"Trainer reminder sent for request {request.id} ({slot_text}) to trainer {request.trainer_id}")
+        except Exception as e:
+            logger.error(f"Error sending trainer reminder for request {request.id}: {e}")
+
+
+async def day_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Клиент нажал «Подтверждаю» в уведомлении за день до тренировки."""
+    query = update.callback_query
+    await query.answer()
+    _, request_id = query.data.split("|", maxsplit=1)
+    try:
+        request = booking_service.get_request(request_id)
+    except KeyError:
+        await query.edit_message_text("Запись не найдена или уже отменена.")
+        return
+    if request.user_id != query.from_user.id:
+        await query.answer("Это не ваша запись.", show_alert=True)
+        return
+    if request.status != "confirmed":
+        await query.edit_message_text("Эта запись уже отменена или изменена.")
+        return
+    slot_text = humanize_slot(request.date, request.time)
+    await query.edit_message_text(
+        f"✅ Отлично, ждём вас завтра в {slot_text}!"
+    )
+
+
+async def day_decline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Клиент нажал «Отказаться» — показываем подтверждение."""
+    query = update.callback_query
+    await query.answer()
+    _, request_id = query.data.split("|", maxsplit=1)
+    try:
+        request = booking_service.get_request(request_id)
+    except KeyError:
+        await query.edit_message_text("Запись не найдена или уже отменена.")
+        return
+    if request.user_id != query.from_user.id:
+        await query.answer("Это не ваша запись.", show_alert=True)
+        return
+    if request.status != "confirmed":
+        await query.edit_message_text("Эта запись уже отменена или изменена.")
+        return
+    await query.edit_message_text(
+        "Вы уверены, что хотите отменить тренировку?",
+        reply_markup=build_day_decline_confirm_keyboard(request_id),
+    )
+
+
+async def day_decline_yes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Клиент подтвердил отмену («Да, отменить»)."""
+    query = update.callback_query
+    await query.answer()
+    _, request_id = query.data.split("|", maxsplit=1)
+    try:
+        request = booking_service.get_request(request_id)
+    except KeyError:
+        await query.edit_message_text("Запись не найдена или уже отменена.")
+        return
+    if request.user_id != query.from_user.id:
+        await query.answer("Это не ваша запись.", show_alert=True)
+        return
+    if request.status != "confirmed":
+        await query.edit_message_text("Эта запись уже отменена или изменена.")
+        return
+    updated = booking_service.update_status(request_id, "cancelled_by_client")
+    await query.edit_message_text(
+        f"Запись на {humanize_slot(updated.date, updated.time)} отменена."
+    )
+    await context.bot.send_message(
+        chat_id=updated.user_id,
+        text=f"Вы отменили запись на {humanize_slot(updated.date, updated.time)}.",
+        reply_markup=build_main_keyboard(updated.user_id),
+    )
+    trainer_telegram_id = trainer_repo.get_telegram_id_by_id(updated.trainer_id) if updated.trainer_id else None
+    admin_text = (
+        "<b>Отмена по уведомлению за день</b>\n"
+        f"Дата: {humanize_slot(updated.date, updated.time)}\n"
+        f"Клиент: {updated.full_name} (@{updated.username or 'нет'} | id {updated.user_id})"
+    )
+    if trainer_telegram_id is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=trainer_telegram_id,
+                text=admin_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to notify trainer {trainer_telegram_id}: {e}")
+    else:
+        await send_to_all_instructors(context, admin_text, parse_mode=ParseMode.HTML)
+
+
+async def day_decline_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Клиент нажал «Нет, остаться» — запись сохраняется."""
+    query = update.callback_query
+    await query.answer()
+    _, request_id = query.data.split("|", maxsplit=1)
+    try:
+        request = booking_service.get_request(request_id)
+    except KeyError:
+        await query.edit_message_text("Запись не найдена или уже отменена.")
+        return
+    if request.user_id != query.from_user.id:
+        await query.answer("Это не ваша запись.", show_alert=True)
+        return
+    slot_text = humanize_slot(request.date, request.time)
+    await query.edit_message_text(
+        f"✅ Запись сохранена. Ждём вас завтра в {slot_text}!"
+    )
 
 
 def register_handlers(application: Application) -> None:
@@ -2722,6 +2941,11 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(cancel_without_reason_callback, pattern=r"^CANCEL_SKIP\|"))
     application.add_handler(CallbackQueryHandler(admin_cancel_select_callback, pattern=r"^ADMIN_CANCEL\|"))
     application.add_handler(CallbackQueryHandler(admin_cancel_without_reason_callback, pattern=r"^ADMIN_CANCEL_SKIP\|"))
+    # Уведомление за день: Подтверждаю / Отказаться (с подтверждением)
+    application.add_handler(CallbackQueryHandler(day_confirm_callback, pattern=r"^DAY_CONFIRM\|"))
+    application.add_handler(CallbackQueryHandler(day_decline_callback, pattern=r"^DAY_DECLINE\|"))
+    application.add_handler(CallbackQueryHandler(day_decline_yes_callback, pattern=r"^DAY_DECLINE_YES\|"))
+    application.add_handler(CallbackQueryHandler(day_decline_no_callback, pattern=r"^DAY_DECLINE_NO\|"))
     
     # Schedule management handlers
     application.add_handler(CallbackQueryHandler(schedule_menu_callback, pattern=r"^SCHEDULE_MENU$"))
@@ -2799,15 +3023,15 @@ def main() -> None:
     application = Application.builder().token(settings.bot_token).build()
     register_handlers(application)
 
-    # Schedule reminder job to run every 5 minutes
+    # Проверка напоминаний раз в минуту (за день и за 2 часа)
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(
             send_reminders,
-            interval=300,  # 5 minutes
-            first=10,  # Start after 10 seconds
+            interval=60,  # 1 минута
+            first=10,
         )
-        logger.info("Reminder job scheduled (runs every 5 minutes)")
+        logger.info("Reminder job scheduled (runs every 1 minute)")
         
         # Schedule regular client bookings sync to run daily
         job_queue.run_daily(
@@ -2816,7 +3040,8 @@ def main() -> None:
         )
         logger.info("Regular client bookings sync scheduled (runs daily at midnight)")
 
-    application.run_polling(drop_pending_updates=True)
+    # poll_interval=1 — быстрый отклик на сообщения и кнопки; фоновые напоминания по-прежнему раз в 60 сек
+    application.run_polling(drop_pending_updates=True, poll_interval=1)
 
 
 def ensure_event_loop() -> None:
@@ -2833,8 +3058,6 @@ if __name__ == "__main__":
     try:
         run_migrations()
         ensure_initial_trainers()
-        # Initialize connection pool for faster DB access
-        _init_connection_pool()
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
         # После полного перехода на БД отсутствие подключения станет критичной ошибкой.

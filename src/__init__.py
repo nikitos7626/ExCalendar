@@ -1,2 +1,10 @@
-__all__ = ["bot", "config", "booking_store", "keyboards"]
+__all__ = [
+    "bot",
+    "config",
+    "keyboards",
+    "models",
+    "repositories",
+    "services",
+    "views",
+]
 

@@ -18,10 +18,10 @@
 
 ## Техническая реализация
 
-*   **Стек:** Python 3.11+, aiogram (Telegram API).
-*   **Хранение данных:** Локальное хранилище на основе JSON (`bookings.json`, `schedule_blocks.json`).
+*   **Стек:** Python 3.11+, python-telegram-bot (Telegram API).
+*   **Хранение данных:** Брони — MySQL; блокировки расписания и настройки — JSON (`schedule_blocks.json`). Для MySQL нужна переменная `DATABASE_URL` в формате `mysql://user:password@host:3306/excalendar`.
 *   **Фоновые задачи:** Использование `JobQueue` для периодической проверки расписания и отправки напоминаний.
-*   **Конфигурация:** Управление параметрами через `.env` файл (часовой пояс, горизонт планирования).
+*   **Конфигурация:** Управление параметрами через `config.env` / `.env` (часовой пояс, горизонт планирования, `DATABASE_URL`).
 
 ## Установка и запуск
 
@@ -32,9 +32,10 @@
     pip install -r requirements.txt
     ```
 
-2.  Настроить переменные окружения в файле `.env`:
+2.  Настроить переменные окружения в файле `config.env` или `.env`:
     *   `TELEGRAM_BOT_TOKEN`
     *   `INSTRUCTOR_CHAT_ID`
+    *   `DATABASE_URL` — строка подключения к MySQL, например `mysql://user:password@localhost:3306/excalendar`
     *   `TIMEZONE` (по умолчанию Europe/Moscow)
 
 3.  Запустить бота:

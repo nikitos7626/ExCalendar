@@ -18,10 +18,10 @@
 
 ## Техническая реализация
 
-*   **Стек:** Python 3.11+, aiogram (Telegram API).
-*   **Хранение данных:** Локальное хранилище на основе JSON (`bookings.json`, `schedule_blocks.json`).
+*   **Стек:** Python 3.11+, python-telegram-bot (Telegram API).
+*   **Хранение данных:** Брони — MySQL; блокировки расписания и настройки — JSON (`schedule_blocks.json`). Для MySQL нужна переменная `DATABASE_URL` в формате `mysql://user:password@host:3306/excalendar`.
 *   **Фоновые задачи:** Использование `JobQueue` для периодической проверки расписания и отправки напоминаний.
-*   **Конфигурация:** Управление параметрами через `.env` файл (часовой пояс, горизонт планирования).
+*   **Конфигурация:** Управление параметрами через `config.env` / `.env` (часовой пояс, горизонт планирования, `DATABASE_URL`).
 
 ## Установка и запуск
 
@@ -32,15 +32,40 @@
     pip install -r requirements.txt
     ```
 
-2.  Настроить переменные окружения в файле `.env`:
+2.  Настроить переменные окружения в файле `config.env` или `.env`:
     *   `TELEGRAM_BOT_TOKEN`
     *   `INSTRUCTOR_CHAT_ID`
+    *   `DATABASE_URL` — строка подключения к MySQL, например `mysql://user:password@localhost:3306/excalendar`
     *   `TIMEZONE` (по умолчанию Europe/Moscow)
 
 3.  Запустить бота:
     ```bash
     python -m src.bot
     ```
+
+## Деплой на Fly.io
+
+В репозитории есть `Dockerfile` и `fly.toml`. Если после нажатия **Deploy** вывод показывает **failed**:
+
+1. **Убедиться, что в ветке (например `test`) есть файлы:** `Dockerfile`, `fly.toml`, `requirements.txt`, папка `src/`.
+
+2. **Задать секреты** (в панели Fly.io: **Secrets**, или в CLI):
+   ```bash
+   fly secrets set TELEGRAM_BOT_TOKEN=ваш_токен
+   fly secrets set DATABASE_URL="mysql://user:password@host:3306/excalendar"
+   fly secrets set INSTRUCTOR_CHAT_ID=123456789
+   ```
+   Либо тренеров по нику:
+   ```bash
+   fly secrets set INSTRUCTOR_USERNAMES=nikit,coach
+   ```
+   По желанию: `TIMEZONE=Europe/Moscow`, `BOT_USERNAME=...`, `TRAINER_REMINDER_MINUTES=15`.
+
+3. **MySQL должен быть доступен с Fly.io** (внешний хостинг БД или Fly Postgres/другой сервис с MySQL). Указать его в `DATABASE_URL`.
+
+4. **Current Working Directory** в настройках деплоя оставить пустым (корень репозитория).
+
+После сохранения секретов нажать **Deploy** снова.
 
 ## Структура проекта
 

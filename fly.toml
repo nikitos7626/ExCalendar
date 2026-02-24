@@ -1,0 +1,18 @@
+# Fly.io — ExCalendar Telegram bot
+# Деплой: fly deploy (или через панель Deploy)
+# Секреты задать: fly secrets set TELEGRAM_BOT_TOKEN=xxx DATABASE_URL=mysql://... INSTRUCTOR_CHAT_ID=123 или INSTRUCTOR_USERNAMES=nikit
+
+app = "exoldcalendar"
+
+[build]
+
+[env]
+  # Конфиг через переменные окружения (fly secrets), не через config.env
+
+# Бот работает по long polling, HTTP не нужен
+# Если Fly требует порт — раскомментируйте и добавьте в бот простой health-check на порту 8080
+# [[services]]
+#   internal_port = 8080
+#   protocol = "tcp"
+#   [[services.ports]]
+#     port = 80

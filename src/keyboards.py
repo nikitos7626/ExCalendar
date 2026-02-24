@@ -152,6 +152,30 @@ def build_cancel_reason_keyboard(request_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def build_day_before_confirm_keyboard(request_id: str) -> InlineKeyboardMarkup:
+    """Клавиатура за день до тренировки: подтвердить или отказаться."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Подтверждаю", callback_data=f"DAY_CONFIRM|{request_id}"),
+                InlineKeyboardButton("❌ Отказаться", callback_data=f"DAY_DECLINE|{request_id}"),
+            ]
+        ]
+    )
+
+
+def build_day_decline_confirm_keyboard(request_id: str) -> InlineKeyboardMarkup:
+    """Подтверждение отмены: да, отменить / нет, остаться."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Да, отменить", callback_data=f"DAY_DECLINE_YES|{request_id}"),
+                InlineKeyboardButton("Нет, остаться", callback_data=f"DAY_DECLINE_NO|{request_id}"),
+            ]
+        ]
+    )
+
+
 def build_admin_cancel_keyboard(options: Iterable[Tuple[str, str]]) -> InlineKeyboardMarkup:
     buttons: List[List[InlineKeyboardButton]] = []
     for request_id, label in options:

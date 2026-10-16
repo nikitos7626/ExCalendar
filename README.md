@@ -43,29 +43,17 @@
     python -m src.bot
     ```
 
-## Деплой на Fly.io
+## Запуск в Docker
 
-В репозитории есть `Dockerfile` и `fly.toml`. Если после нажатия **Deploy** вывод показывает **failed**:
-
-1. **Убедиться, что в ветке (например `test`) есть файлы:** `Dockerfile`, `fly.toml`, `requirements.txt`, папка `src/`.
-
-2. **Задать секреты** (в панели Fly.io: **Secrets**, или в CLI):
+1. Собрать образ:
    ```bash
-   fly secrets set TELEGRAM_BOT_TOKEN=ваш_токен
-   fly secrets set DATABASE_URL="mysql://user:password@host:3306/excalendar"
-   fly secrets set INSTRUCTOR_CHAT_ID=123456789
+   docker build -t excalendar-bot .
    ```
-   Либо тренеров по нику:
+
+2. Запустить контейнер:
    ```bash
-   fly secrets set INSTRUCTOR_USERNAMES=nikit,coach
+   docker run -d --name excalendar-bot --env-file config.env excalendar-bot
    ```
-   По желанию: `TIMEZONE=Europe/Moscow`, `BOT_USERNAME=...`, `TRAINER_REMINDER_MINUTES=15`.
-
-3. **MySQL должен быть доступен с Fly.io** (внешний хостинг БД или Fly Postgres/другой сервис с MySQL). Указать его в `DATABASE_URL`.
-
-4. **Current Working Directory** в настройках деплоя оставить пустым (корень репозитория).
-
-После сохранения секретов нажать **Deploy** снова.
 
 ## Структура проекта
 

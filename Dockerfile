@@ -1,4 +1,4 @@
-# ExCalendar Telegram bot — образ для Fly.io
+# ExCalendar Telegram bot
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -9,6 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Бот читает config из переменных окружения (fly secrets)
+# Бот читает config из переменных окружения
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "-m", "src.bot"]
